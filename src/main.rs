@@ -1,9 +1,8 @@
 use crate::repl::Repl;
 
-
-mod state;
+mod buffer;
 mod repl;
-mod editor;
+mod state;
 
 fn main() {
     Repl::begin();

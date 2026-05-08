@@ -1,4 +1,4 @@
-use std::{ error::Error, fmt::Display, io, iter::Peekable, str::Chars };
+use std::{error::Error, fmt::Display, io, iter::Peekable, str::Chars};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandFlow {
@@ -6,20 +6,22 @@ pub enum CommandFlow {
     Input,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Address {
     None,
     Single(Line),
     Range(Line, Line),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
-    Current,
-    First,
-    Last,
-    Absolute(usize),
+    Current(isize),
+    First(isize),
+    Last(isize),
+    Absolute(usize, isize),
     Offset(isize),
+    Regex(String, isize),
+    RegexBackward(String, isize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,7 @@ pub enum CommandKind {
     Write(Option<String>),
     Edit(String),
     List,
+    NumberedList,
     Delete,
     Undo,
     InternalListLastAffectedLine,
@@ -43,11 +46,19 @@ pub struct Command {
 
 impl Command {
     fn new(address: Address, kind: CommandKind, suffix: Option<CommandKind>) -> Self {
-        Self { address, kind, suffix }
+        Self {
+            address,
+            kind,
+            suffix,
+        }
     }
 
     pub fn empty(kind: CommandKind) -> Self {
-        Self { address: Address::None, kind, suffix: None }
+        Self {
+            address: Address::None,
+            kind,
+            suffix: None,
+        }
     }
 }
 
@@ -77,7 +88,9 @@ struct ParserInternal<'a> {
 
 impl<'a> ParserInternal<'a> {
     fn new(input: &'a str) -> Self {
-        Self { chars: input.chars().peekable() }
+        Self {
+            chars: input.chars().peekable(),
+        }
     }
 
     fn peek(&mut self) -> Option<char> {
@@ -100,6 +113,9 @@ impl<'a> ParserInternal<'a> {
     }
 
     fn parse_number(&mut self) -> Option<usize> {
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
+            self.consume();
+        }
         let mut s = String::new();
         while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
             s.push(self.consume().unwrap());
@@ -108,7 +124,7 @@ impl<'a> ParserInternal<'a> {
     }
 
     fn parse_command(&mut self) -> Result<(CommandKind, Option<CommandKind>), EdError> {
-        while self.peek() == Some(' ') {
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
             self.consume();
         }
 
@@ -118,32 +134,28 @@ impl<'a> ParserInternal<'a> {
             'q' => CommandKind::Quit,
             'a' => CommandKind::Append,
             'l' => CommandKind::List,
+            'n' => CommandKind::NumberedList,
             'd' => CommandKind::Delete,
             'u' => CommandKind::Undo,
-            'w' =>
-                CommandKind::Write({
-                    if self.peek().is_some_and(|c| c == ' ') {
-                        while self.peek() == Some(' ') {
-                            self.consume();
-                        }
-                        let s = self.parse_rest();
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(s)
-                        }
-                    } else {
-                        return Err(EdError::SuffixUnsuported);
+            'w' => CommandKind::Write({
+                if self
+                    .peek()
+                    .is_some_and(|c| c.is_whitespace() || c.is_control())
+                {
+                    while self.peek().is_some_and(|c| c.is_whitespace()) {
+                        self.consume();
                     }
-                }),
-            'e' =>
-                CommandKind::Edit(
-                    if self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
-                        self.parse_rest()
-                    } else {
-                        return Err(EdError::SuffixUnsuported);
-                    }
-                ),
+                    let s = self.parse_rest();
+                    if s.is_empty() { None } else { Some(s) }
+                } else {
+                    return Err(EdError::SuffixUnsuported);
+                }
+            }),
+            'e' => CommandKind::Edit(if self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+                self.parse_rest()
+            } else {
+                return Err(EdError::SuffixUnsuported);
+            }),
             c if c.is_ascii_whitespace() => CommandKind::InternalListLastAffectedLine,
             _ => {
                 return Err(EdError::UnknownCommand);
@@ -165,67 +177,115 @@ impl<'a> ParserInternal<'a> {
         }
     }
 
-    fn parse_line(&mut self) -> Option<Line> {
+    fn parse_line(&mut self) -> Result<Option<Line>, EdError> {
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
+            self.consume();
+        }
         match self.peek() {
             Some('.') => {
                 self.consume();
-                Some(Line::Current)
+                let offset = self.parse_offset();
+                Ok(Some(Line::Current(offset)))
             }
             Some('$') => {
                 self.consume();
-                Some(Line::Last)
+                let offset = self.parse_offset();
+                Ok(Some(Line::Last(offset)))
             }
-            Some('+') => {
+            Some('+') => Ok(Some(Line::Offset(self.parse_offset()))),
+            Some('-') => Ok(Some(Line::Offset(self.parse_offset()))),
+            Some(d) if d.is_ascii_digit() => {
+                let value = self.parse_number().unwrap();
+                let offset = self.parse_offset();
+                Ok(Some(Line::Absolute(value, offset)))
+            }
+            Some('/') => {
                 self.consume();
-                Some(
-                    Line::Offset(
-                        self
-                            .parse_number()
-                            .map(|n| n as isize)
-                            .unwrap_or(1)
-                    )
-                )
+                let mut regex = String::new();
+                while self.peek().is_some_and(|c| c != '/') {
+                    regex.push(self.consume().unwrap_or_default());
+                }
+                if self.peek().is_some_and(|c| c == '/') {
+                    self.consume();
+                    let offset = self.parse_offset();
+                    Ok(Some(Line::Regex(regex, offset)))
+                } else {
+                    Ok(Some(Line::Regex(regex, 0)))
+                }
             }
-            Some('-') => {
+            Some('?') => {
                 self.consume();
-                Some(
-                    Line::Offset(
-                        -self
-                            .parse_number()
-                            .map(|n| n as isize)
-                            .unwrap_or(-1)
-                    )
-                )
+                let mut regex = String::new();
+                while self.peek().is_some_and(|c| c != '?') {
+                    regex.push(self.consume().unwrap_or_default());
+                }
+                if self.peek().is_some_and(|c| c == '?') {
+                    self.consume();
+                    let offset = self.parse_offset();
+                    Ok(Some(Line::RegexBackward(regex, offset)))
+                } else {
+                    Ok(Some(Line::RegexBackward(regex, 0)))
+                }
             }
-            Some(d) if d.is_ascii_digit() => Some(Line::Absolute(self.parse_number().unwrap())),
-            _ => None,
+            _ => Ok(None),
         }
     }
 
+    fn parse_offset(&mut self) -> isize {
+        let mut result = 0;
+        loop {
+            while self.peek().is_some_and(|c| c.is_whitespace()) {
+                self.consume();
+            }
+            match self.peek() {
+                Some('+') => {
+                    self.consume();
+                    result += self.parse_number().map(|n| n as isize).unwrap_or(1);
+                }
+                Some('-') => {
+                    self.consume();
+                    result -= self.parse_number().map(|n| n as isize).unwrap_or(1);
+                }
+                Some(d) if d.is_numeric() => {
+                    result += self.parse_number().unwrap_or(0) as isize;
+                }
+                _ => {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
     fn parse_address(&mut self) -> Result<Address, EdError> {
-        if self.peek() == Some('%') {
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
             self.consume();
-            return Ok(Address::Range(Line::First, Line::Last));
         }
 
-        let first = self.parse_line();
+        if self.peek() == Some('%') {
+            self.consume();
+            let offset = self.parse_offset();
+            return Ok(Address::Range(Line::First(offset), Line::Last(offset)));
+        }
+
+        let first = self.parse_line()?;
         if self.peek() == Some(',') {
             self.consume();
-            let second = self.parse_line();
+            let second = self.parse_line()?;
             match (first, second) {
                 (Some(a), Some(b)) => Ok(Address::Range(a, b)),
-                (Some(a), None) => Ok(Address::Range(a, Line::Last)),
-                (None, Some(b)) => Ok(Address::Range(Line::First, b)),
-                (None, None) => Ok(Address::Range(Line::First, Line::Last)),
+                (Some(a), None) => Ok(Address::Range(a, Line::Last(0))),
+                (None, Some(b)) => Ok(Address::Range(Line::First(0), b)),
+                (None, None) => Ok(Address::Range(Line::First(0), Line::Last(0))),
             }
         } else if self.peek() == Some(';') {
             self.consume();
-            let second = self.parse_line();
+            let second = self.parse_line()?;
             match (first, second) {
                 (Some(a), Some(b)) => Ok(Address::Range(a, b)),
-                (Some(a), None) => Ok(Address::Range(a, a)),
-                (None, Some(b)) => Ok(Address::Range(Line::Current, b)),
-                (None, None) => Ok(Address::Range(Line::Current, Line::Last)),
+                (Some(a), None) => Ok(Address::Range(a.clone(), a)),
+                (None, Some(b)) => Ok(Address::Range(Line::Current(0), b)),
+                (None, None) => Ok(Address::Range(Line::Current(0), Line::Last(0))),
             }
         } else {
             match first {
@@ -241,8 +301,12 @@ pub enum EdError {
     UnknownCommand,
     SuffixUnsuported,
     InvalidRange,
+    InvalidAddress,
     InvalidFilename,
+    RegexNotFound,
+    RegexInvalid,
     IoError(io::Error),
+    RegexError(regex::Error),
 }
 
 impl Display for EdError {
@@ -253,6 +317,10 @@ impl Display for EdError {
             EdError::InvalidRange => "Invalid Range".to_owned(),
             EdError::InvalidFilename => "Invalid Filename".to_owned(),
             EdError::IoError(error) => error.to_string(),
+            EdError::RegexError(error) => error.to_string(),
+            EdError::InvalidAddress => "Invalid Address".to_owned(),
+            EdError::RegexNotFound => "Regex Not Found".to_owned(),
+            EdError::RegexInvalid => "Regex Invalid".to_owned(),
         };
         write!(f, "{}", message)
     }
@@ -263,5 +331,11 @@ impl Error for EdError {}
 impl From<io::Error> for EdError {
     fn from(value: io::Error) -> Self {
         Self::IoError(value)
+    }
+}
+
+impl From<regex::Error> for EdError {
+    fn from(value: regex::Error) -> Self {
+        Self::RegexError(value)
     }
 }

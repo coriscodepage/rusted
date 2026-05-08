@@ -1,8 +1,11 @@
-use std::{ fs::File, io::{ self, Write } };
+use std::{
+    fs::File,
+    io::{self, Write},
+};
 
 use crate::{
-    editor::{ Buffer, Snapshot },
-    state::{ Command, CommandFlow, CommandKind, EdError, Parser },
+    buffer::{Buffer, Snapshot},
+    state::{Command, CommandFlow, CommandKind, EdError, Parser},
 };
 
 pub struct Repl {
@@ -40,8 +43,10 @@ impl Repl {
                 continue;
             }
             match repl.flow {
-                CommandFlow::Command => if repl.command_flow(&line).is_err() {
-                    Self::print_err();
+                CommandFlow::Command => {
+                    if repl.command_flow(&line).is_err() {
+                        Self::print_err();
+                    }
                 }
                 CommandFlow::Input => repl.input_flow(&line),
             }
@@ -73,7 +78,7 @@ impl Repl {
             }
             CommandKind::Append => {
                 let snapshot = self.buffer.save_snapshot();
-                self.buffer.set_mode(&command.address);
+                self.buffer.set_mode(&command.address)?;
                 self.postfix_command = command.suffix;
                 self.flow = CommandFlow::Input;
                 self.snapshot = Some(snapshot);
@@ -93,26 +98,30 @@ impl Repl {
             }
             CommandKind::Edit(_) => todo!(),
             CommandKind::List => {
-                self.buffer.set_range(&command.address);
+                self.buffer.set_range(&command.address)?;
                 print!("{}", self.buffer.get_lines()?.well_defined());
+            }
+            CommandKind::NumberedList => {
+                self.buffer.set_range(&command.address)?;
+                print!("{}", self.buffer.get_lines()?.numbered());
             }
             CommandKind::Delete => {
                 let snapshot = self.buffer.save_snapshot();
-                self.buffer.set_range(&command.address);
+                self.buffer.set_range(&command.address)?;
                 self.buffer.delete()?;
                 self.snapshot = Some(snapshot);
             }
             CommandKind::InternalListLastAffectedLine => {
-                self.buffer.set_range(&command.address);
+                self.buffer.set_range(&command.address)?;
                 print!("{}", self.buffer.get_active_line()?);
             }
             CommandKind::Undo => {
                 if let Some(restore) = self.snapshot.take() {
                     let snapshot = self.buffer.save_snapshot();
                     self.buffer.restore_snapshot(restore);
-                    self.snapshot = Some(snapshot)    
+                    self.snapshot = Some(snapshot);
                 }
-            },
+            }
         }
         Ok(())
     }
