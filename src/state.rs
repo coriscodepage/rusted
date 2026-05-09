@@ -1,4 +1,10 @@
-use std::{error::Error, fmt::Display, io, iter::Peekable, str::Chars};
+use std::{
+    error::Error,
+    fmt::{Debug, Display},
+    io,
+    iter::Peekable,
+    str::Chars,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandFlow {
@@ -11,6 +17,7 @@ pub enum Address {
     None,
     Single(Line),
     Range(Line, Line),
+    RangeSemicolon(Line, Line),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,20 +31,104 @@ pub enum Line {
     RegexBackward(String, isize),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub trait MultiLineCommand: Debug {
+    fn handle_line(&mut self, line: &str) -> Result<(), EdError>;
+    fn is_done(&self) -> bool;
+    fn finish(self: Box<Self>) -> Result<CommandKind, EdError>;
+}
+
+#[derive(Debug)]
+struct MLCSubstitution {
+    re: Option<String>,
+    sub: Vec<String>,
+    flag: Option<char>,
+    is_done: bool,
+}
+
+impl MLCSubstitution {
+    fn new(re: Option<String>, sub: String) -> Self {
+        let mut subs = Vec::new();
+        subs.push(sub);
+        Self {
+            re,
+            sub: subs,
+            flag: None,
+            is_done: false,
+        }
+    }
+}
+
+impl MultiLineCommand for MLCSubstitution {
+    fn handle_line(&mut self, line: &str) -> Result<(), EdError> {
+        let mut parser = ParserInternal::new(line);
+        let mut sub = String::new();
+        self.is_done = true;
+        while let Some(c) = parser.peek() {
+            if c == '\\' {
+                parser.consume();
+                if let Some(v) = parser.peek() {
+                    if v == '\n' {
+                        self.is_done = false;
+                        sub.push('\n');
+                        continue;
+                    }
+                }
+            } else if c == '/' || c.is_control() {
+                break;
+            }
+            parser.consume();
+            sub.push(c);
+        }
+        self.sub.push(sub);
+        self.flag = parser
+            .peek()
+            .filter(|&c| c == '/')
+            .map(|_| parser.consume())
+            .and_then(|_| parser.peek())
+            .filter(|c| ['g', 'l', 'n', 'p'].contains(c));
+        parser.consume();
+        Ok(())
+    }
+
+    fn is_done(&self) -> bool {
+        self.is_done
+    }
+
+    fn finish(self: Box<Self>) -> Result<CommandKind, EdError> {
+        Ok(CommandKind::Substitution { re: self.re, sub: self.sub, flag: self.flag })
+    }
+}
+
+#[derive(Debug)]
 pub enum CommandKind {
+    NoOP,
     Quit,
     Append,
+    Insert,
+    Change,
+    Yank,
+    Delete,
+    Transfer(Address),
+    MultiLineCommand(Box<dyn MultiLineCommand>),
+    Substitution {
+        re: Option<String>,
+        sub: Vec<String>,
+        flag: Option<char>,
+    },
+    Put,
+    Join,
+    Move(Address),
     Write(Option<String>),
-    Edit(String),
+    Edit(Option<String>),
+    Read(Option<String>),
     List,
     NumberedList,
-    Delete,
+    PrintList,
     Undo,
     InternalListLastAffectedLine,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Command {
     pub address: Address,
     pub kind: CommandKind,
@@ -62,22 +153,47 @@ impl Command {
     }
 }
 
-pub struct Parser {}
+pub struct Parser {
+    mlc: Option<(Box<dyn MultiLineCommand>, Address)>,
+}
 
 impl Parser {
     pub fn new() -> Self {
-        Self {}
+        Self { mlc: None }
     }
 
-    pub fn parse(&self, input: &str) -> Result<Command, EdError> {
+    pub fn parse(&mut self, input: &str) -> Result<Command, EdError> {
+        if let Some(mlc) = self.mlc.take() {
+            return Ok(self.handle_mlc(mlc.0, mlc.1, input)?);
+        }
         let mut parser = ParserInternal::new(input);
         let address = parser.parse_address()?;
         let (kind, suffix) = parser.parse_command()?;
 
-        if kind == CommandKind::InternalListLastAffectedLine && address == Address::None {
+        if matches!(kind, CommandKind::InternalListLastAffectedLine) && address == Address::None {
             Err(EdError::UnknownCommand)
+        } else if let CommandKind::MultiLineCommand(cmd) = kind {
+            self.mlc = Some((cmd, address));
+            Ok(Command::empty(CommandKind::NoOP))
         } else {
             Ok(Command::new(address, kind, suffix))
+        }
+    }
+
+    fn handle_mlc(
+        &mut self,
+        mut cmd: Box<dyn MultiLineCommand>,
+        address: Address,
+        line: &str,
+    ) -> Result<Command, EdError> {
+        cmd.handle_line(&line)?;
+        if cmd.is_done() {
+            let kind = cmd.finish()?;
+            self.mlc = None;
+            Ok(Command::new(address, kind, None))
+        } else {
+            self.mlc = Some((cmd, address));
+            Ok(Command::empty(CommandKind::NoOP))
         }
     }
 }
@@ -112,10 +228,14 @@ impl<'a> ParserInternal<'a> {
         r
     }
 
-    fn parse_number(&mut self) -> Option<usize> {
+    fn skip_whitespace(&mut self) {
         while self.peek().is_some_and(|c| c.is_whitespace()) {
             self.consume();
         }
+    }
+
+    fn parse_number(&mut self) -> Option<usize> {
+        self.skip_whitespace();
         let mut s = String::new();
         while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
             s.push(self.consume().unwrap());
@@ -124,38 +244,95 @@ impl<'a> ParserInternal<'a> {
     }
 
     fn parse_command(&mut self) -> Result<(CommandKind, Option<CommandKind>), EdError> {
-        while self.peek().is_some_and(|c| c.is_whitespace()) {
-            self.consume();
-        }
+        self.skip_whitespace();
 
         let cmd = self.consume().unwrap_or('\n');
 
         let candidate = match cmd {
             'q' => CommandKind::Quit,
             'a' => CommandKind::Append,
+            'c' => CommandKind::Change,
+            'i' => CommandKind::Insert,
+            'm' => CommandKind::Move(self.parse_address()?),
+            't' => CommandKind::Transfer(self.parse_address()?),
+            'j' => CommandKind::Join,
+            'y' => CommandKind::Yank,
+            'x' => CommandKind::Put,
             'l' => CommandKind::List,
             'n' => CommandKind::NumberedList,
+            'p' => CommandKind::PrintList,
             'd' => CommandKind::Delete,
             'u' => CommandKind::Undo,
-            'w' => CommandKind::Write({
-                if self
-                    .peek()
-                    .is_some_and(|c| c.is_whitespace() || c.is_control())
-                {
-                    while self.peek().is_some_and(|c| c.is_whitespace()) {
-                        self.consume();
-                    }
-                    let s = self.parse_rest();
-                    if s.is_empty() { None } else { Some(s) }
-                } else {
-                    return Err(EdError::SuffixUnsuported);
+            'w' => CommandKind::Write(self.get_filename()?),
+            'e' => CommandKind::Edit(self.get_filename()?),
+            'r' => CommandKind::Read(self.get_filename()?),
+            's' => {
+                let separator = self.consume().ok_or(EdError::EndOfInput)?;
+                if separator.is_whitespace() {
+                    return Err(EdError::InvalidInput);
                 }
-            }),
-            'e' => CommandKind::Edit(if self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
-                self.parse_rest()
-            } else {
-                return Err(EdError::SuffixUnsuported);
-            }),
+                let mut re = String::new();
+                while let Some(c) = self.peek() {
+                    if c == '\\' {
+                        self.consume();
+                        if let Some(v) = self.peek() {
+                            if v == separator {
+                                self.consume();
+                                re.push(v);
+                                continue;
+                            } else if v == '\\' {
+                                self.consume();
+                                re.push(v);
+                                continue;
+                            }
+                        }
+                    } else if c == separator {
+                        break;
+                    }
+                    self.consume();
+                    re.push(c);
+                }
+                if self.peek().is_none_or(|c| c != separator) {
+                    return Err(EdError::EndOfInput);
+                } else {
+                    self.consume();
+                }
+
+                let mut sub = String::new();
+                while let Some(c) = self.peek() {
+                    if c == '\\' {
+                        self.consume();
+                        if let Some(v) = self.peek() {
+                            if v == '\n' {
+                                sub.push('\n');
+                                return Ok((
+                                    CommandKind::MultiLineCommand(Box::new(MLCSubstitution::new(
+                                        Some(re),
+                                        sub,
+                                    ))),
+                                    None,
+                                ));
+                            }
+                        }
+                    } else if c == '/' || c.is_control() {
+                        break;
+                    }
+                    self.consume();
+                    sub.push(c);
+                }
+                let flag = self
+                    .peek()
+                    .filter(|&c| c == '/')
+                    .map(|_| self.consume())
+                    .and_then(|_| self.peek())
+                    .filter(|c| ['g', 'l', 'n', 'p'].contains(c) || c.is_numeric());
+                self.consume();
+                CommandKind::Substitution {
+                    re: Some(re),
+                    sub: vec![sub],
+                    flag: flag,
+                }
+            }
             c if c.is_ascii_whitespace() => CommandKind::InternalListLastAffectedLine,
             _ => {
                 return Err(EdError::UnknownCommand);
@@ -165,8 +342,8 @@ impl<'a> ParserInternal<'a> {
         if self.peek().is_some_and(|v| !v.is_ascii_whitespace()) {
             let suffix = match self.consume().unwrap() {
                 'l' => CommandKind::List,
-                'n' => todo!(),
-                'p' => todo!(),
+                'n' => CommandKind::NumberedList,
+                'p' => CommandKind::PrintList,
                 _ => {
                     return Err(EdError::UnknownCommand);
                 }
@@ -177,10 +354,23 @@ impl<'a> ParserInternal<'a> {
         }
     }
 
-    fn parse_line(&mut self) -> Result<Option<Line>, EdError> {
-        while self.peek().is_some_and(|c| c.is_whitespace()) {
-            self.consume();
+    fn get_filename(&mut self) -> Result<Option<String>, EdError> {
+        if self
+            .peek()
+            .is_some_and(|c| c.is_whitespace() || c.is_control())
+        {
+            while self.peek().is_some_and(|c| c.is_whitespace()) {
+                self.consume();
+            }
+            let s = self.parse_rest();
+            if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
+        } else {
+            Err(EdError::SuffixUnsuported)
         }
+    }
+
+    fn parse_line(&mut self) -> Result<Option<Line>, EdError> {
+        self.skip_whitespace();
         match self.peek() {
             Some('.') => {
                 self.consume();
@@ -192,8 +382,7 @@ impl<'a> ParserInternal<'a> {
                 let offset = self.parse_offset();
                 Ok(Some(Line::Last(offset)))
             }
-            Some('+') => Ok(Some(Line::Offset(self.parse_offset()))),
-            Some('-') => Ok(Some(Line::Offset(self.parse_offset()))),
+            Some('+') | Some('-') => Ok(Some(Line::Offset(self.parse_offset()))),
             Some(d) if d.is_ascii_digit() => {
                 let value = self.parse_number().unwrap();
                 let offset = self.parse_offset();
@@ -234,9 +423,7 @@ impl<'a> ParserInternal<'a> {
     fn parse_offset(&mut self) -> isize {
         let mut result = 0;
         loop {
-            while self.peek().is_some_and(|c| c.is_whitespace()) {
-                self.consume();
-            }
+            self.skip_whitespace();
             match self.peek() {
                 Some('+') => {
                     self.consume();
@@ -258,9 +445,7 @@ impl<'a> ParserInternal<'a> {
     }
 
     fn parse_address(&mut self) -> Result<Address, EdError> {
-        while self.peek().is_some_and(|c| c.is_whitespace()) {
-            self.consume();
-        }
+        self.skip_whitespace();
 
         if self.peek() == Some('%') {
             self.consume();
@@ -274,7 +459,7 @@ impl<'a> ParserInternal<'a> {
             let second = self.parse_line()?;
             match (first, second) {
                 (Some(a), Some(b)) => Ok(Address::Range(a, b)),
-                (Some(a), None) => Ok(Address::Range(a, Line::Last(0))),
+                (Some(a), None) => Ok(Address::Range(a.clone(), a)),
                 (None, Some(b)) => Ok(Address::Range(Line::First(0), b)),
                 (None, None) => Ok(Address::Range(Line::First(0), Line::Last(0))),
             }
@@ -282,10 +467,10 @@ impl<'a> ParserInternal<'a> {
             self.consume();
             let second = self.parse_line()?;
             match (first, second) {
-                (Some(a), Some(b)) => Ok(Address::Range(a, b)),
-                (Some(a), None) => Ok(Address::Range(a.clone(), a)),
-                (None, Some(b)) => Ok(Address::Range(Line::Current(0), b)),
-                (None, None) => Ok(Address::Range(Line::Current(0), Line::Last(0))),
+                (Some(a), Some(b)) => Ok(Address::RangeSemicolon(a, b)),
+                (Some(a), None) => Ok(Address::RangeSemicolon(a.clone(), a)),
+                (None, Some(b)) => Ok(Address::RangeSemicolon(Line::Current(0), b)),
+                (None, None) => Ok(Address::RangeSemicolon(Line::Current(0), Line::Last(0))),
             }
         } else {
             match first {
@@ -299,12 +484,15 @@ impl<'a> ParserInternal<'a> {
 #[derive(Debug)]
 pub enum EdError {
     UnknownCommand,
+    NoData,
     SuffixUnsuported,
     InvalidRange,
     InvalidAddress,
     InvalidFilename,
+    InvalidInput,
     RegexNotFound,
     RegexInvalid,
+    EndOfInput,
     IoError(io::Error),
     RegexError(regex::Error),
 }
@@ -321,6 +509,9 @@ impl Display for EdError {
             EdError::InvalidAddress => "Invalid Address".to_owned(),
             EdError::RegexNotFound => "Regex Not Found".to_owned(),
             EdError::RegexInvalid => "Regex Invalid".to_owned(),
+            EdError::NoData => "No Data".to_owned(),
+            EdError::EndOfInput => "End Of Input".to_owned(),
+            EdError::InvalidInput => "Invalid Input".to_owned(),
         };
         write!(f, "{}", message)
     }

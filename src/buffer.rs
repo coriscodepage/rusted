@@ -8,7 +8,7 @@ pub struct Buffer {
     lines: Vec<String>,
     last_affected_line: usize,
     line_range: (usize, usize),
-    last_bre: Option<String>,
+    pub last_re: Option<String>,
 }
 
 impl Buffer {
@@ -17,12 +17,26 @@ impl Buffer {
             lines: Vec::new(),
             last_affected_line: 0,
             line_range: (0, 0),
-            last_bre: None,
+            last_re: None,
         }
     }
 
     pub fn set_mode(&mut self, address: &Address) -> Result<(), EdError> {
-        self.set_range(address)?;
+        let address = self.parse_address(address)?;
+        if address.0.max(address.1) > self.lines.len() {
+            return Err(EdError::InvalidAddress);
+        }
+        self.line_range = address;
+        self.last_affected_line = self.line_range.1;
+        Ok(())
+    }
+
+    pub fn set_mode_insert(&mut self, address: &Address) -> Result<(), EdError> {
+        let address = self.parse_address(address)?;
+        if address.0.max(address.1) > self.lines.len() {
+            return Err(EdError::InvalidAddress);
+        }
+        self.line_range = (address.0, address.1.saturating_sub(1));
         self.last_affected_line = self.line_range.1;
         Ok(())
     }
@@ -40,7 +54,7 @@ impl Buffer {
         // println!("{:?}", self.lines);
     }
 
-    pub fn delete(&mut self) -> Result<(), EdError> {
+    pub fn delete(&mut self) -> Result<Vec<String>, EdError> {
         let (from, to) = (
             self.line_range
                 .0
@@ -51,11 +65,76 @@ impl Buffer {
                 .checked_sub(1)
                 .ok_or(EdError::InvalidRange)?,
         );
-        if to >= self.lines.len() {
+        self.lines.get(from..=to).ok_or(EdError::InvalidRange)?;
+        self.last_affected_line = (from + 1).min(self.lines.len());
+        let yanked = self.lines.drain(from..=to);
+        Ok(yanked.collect())
+    }
+
+    pub fn adj_change(&mut self) -> Result<(), EdError> {
+        self.last_affected_line = self
+            .line_range
+            .0
+            .checked_sub(1)
+            .ok_or(EdError::InvalidRange)?;
+        Ok(())
+    }
+
+    pub fn move_to(&mut self, address: &Address) -> Result<(), EdError> {
+        let (from, to) = self.line_range;
+        let destination = self.parse_address(address)?.1;
+        if destination >= from && destination <= to {
             return Err(EdError::InvalidRange);
         }
-        self.lines.drain(from..=to);
-        self.last_affected_line = (from + 1).min(self.lines.len());
+        let yanked = self.delete()?;
+        self.line_range = if destination > to {
+            (destination - (to - from + 1), destination)
+        } else {
+            (destination, destination + (to - from))
+        };
+        // println!("set range: {:?}", self.line_range);
+        self.last_affected_line = self.line_range.0;
+        yanked.iter().for_each(|l| self.append(l));
+        // println!("last affected: {}", self.last_affected_line);
+        Ok(())
+    }
+
+    pub fn transfer(&mut self, address: &Address) -> Result<(), EdError> {
+        let (from, to) = self.line_range;
+        let destination = self.parse_address(address)?.1;
+        if destination >= from && destination <= to {
+            return Err(EdError::InvalidRange);
+        }
+
+        let yanked: Vec<String> = self.get_lines()?.into();
+        self.set_mode(address)?;
+        yanked.iter().for_each(|l| self.append(l));
+        // println!("last affected: {}", self.last_affected_line);
+
+        Ok(())
+    }
+
+    pub fn join(&mut self) -> Result<(), EdError> {
+        let (from, to) = (
+            self.line_range
+                .0
+                .checked_sub(1)
+                .ok_or(EdError::InvalidRange)?,
+            self.line_range
+                .1
+                .checked_sub(1)
+                .ok_or(EdError::InvalidRange)?,
+        );
+        if from == to {
+            return Ok(());
+        }
+        self.lines.get(from..=to).ok_or(EdError::InvalidRange)?;
+        let lines = self.lines.drain(from + 1..=to).collect::<Vec<_>>();
+        self.lines.get_mut(from).map(|v| {
+            lines
+                .iter()
+                .for_each(|l| v.push_str(&l.trim_end_matches('\n')))
+        });
         Ok(())
     }
 
@@ -64,6 +143,14 @@ impl Buffer {
             Address::None => Ok((self.last_affected_line, self.last_affected_line)),
             Address::Single(line) => Ok((self.parse_line(line)?, self.parse_line(line)?)),
             Address::Range(line, line1) => Ok((self.parse_line(line)?, self.parse_line(line1)?)),
+            Address::RangeSemicolon(line, line1) => {
+                let first = self.parse_line(line)?;
+                let old = self.last_affected_line;
+                self.last_affected_line = first;
+                let second = self.parse_line(line1);
+                self.last_affected_line = old;
+                Ok((first, second?))
+            }
         }
     }
 
@@ -94,9 +181,9 @@ impl Buffer {
                 .ok_or(EdError::InvalidAddress),
             Line::Regex(body, offset) => {
                 let re = if body.is_empty() {
-                    Regex::new(self.last_bre.as_ref().ok_or(EdError::RegexInvalid)?)?
+                    Regex::new(self.last_re.as_ref().ok_or(EdError::RegexInvalid)?)?
                 } else {
-                    self.last_bre = Some(body.clone());
+                    self.last_re = Some(body.clone());
                     Regex::new(body)?
                 };
                 let index = self
@@ -111,9 +198,9 @@ impl Buffer {
             }
             Line::RegexBackward(body, offset) => {
                 let re = if body.is_empty() {
-                    Regex::new(self.last_bre.as_ref().ok_or(EdError::RegexInvalid)?)?
+                    Regex::new(self.last_re.as_ref().ok_or(EdError::RegexInvalid)?)?
                 } else {
-                    self.last_bre = Some(body.clone());
+                    self.last_re = Some(body.clone());
                     Regex::new(body)?
                 };
                 let index = self
@@ -173,7 +260,7 @@ impl Buffer {
         let last = self.line_range.1;
         let line = self
             .lines
-            .get(last - 1..=last - 1)
+            .get(last.saturating_sub(1)..=last.saturating_sub(1))
             .ok_or(EdError::InvalidRange)?;
         self.last_affected_line = last;
         Ok(BufferView::new(line, self.lines.len()))
@@ -244,13 +331,13 @@ impl<'a> Display for BufferView<'a> {
             if self.numbered {
                 write!(f, "{}\t", self.range_start + i)?;
             }
-            
+
             if self.well_defined {
                 for c in line.chars() {
                     match c {
                         '\t' => write!(f, "\\t")?,
                         '\\' => write!(f, "\\\\")?,
-                        '\n' => {},
+                        '\n' => {}
                         c => write!(f, "{}", c)?,
                     }
                 }
@@ -261,6 +348,12 @@ impl<'a> Display for BufferView<'a> {
             }
         }
         Ok(())
+    }
+}
+
+impl<'a> Into<Vec<String>> for BufferView<'a> {
+    fn into(self) -> Vec<String> {
+        self.lines.to_vec()
     }
 }
 
