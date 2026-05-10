@@ -73,6 +73,7 @@ where
                 && repl.flow == CommandFlow::Input
             {
                 repl.flow = CommandFlow::Command;
+                repl.buffer.exit_mode()?;
                 repl.run_postfix()?;
                 continue;
             }
@@ -139,10 +140,13 @@ where
                 self.snapshot = Some(snapshot);
             }
             CommandKind::Write(name) => {
-                if name.is_some() {
-                    self.current_file = name;
+                if self.current_file.is_none() {
+                    self.current_file = name.clone();
                 }
-                let name = self.current_file.as_ref().ok_or(EdError::InvalidFilename)?;
+                let name = name
+                    .as_ref()
+                    .or(self.current_file.as_ref())
+                    .ok_or(EdError::InvalidFilename)?;
                 let mut file = File::create(name)?;
                 let content = self.buffer.get_lines_for_save(&command.address)?;
                 let bytes = content.as_bytes();
@@ -152,14 +156,14 @@ where
                 self.print_message(&format!("{}", length))?;
             }
             CommandKind::Edit(name) => {
-                if name.is_some() {
-                    self.current_file = name;
-                }
-                let name = self.current_file.as_ref().ok_or(EdError::InvalidFilename)?;
-                let mut file = File::open(name)?;
+                let name = name
+                    .or(self.current_file.take())
+                    .ok_or(EdError::InvalidFilename)?;
+                let mut file = File::open(&name)?;
                 let mut contents = String::new();
                 file.read_to_string(&mut contents)?;
                 self.reset();
+                self.current_file = Some(name);
                 contents.lines().for_each(|l| self.buffer.append(l));
                 self.print_message(&format!("{}", contents.len()))?;
             }
@@ -175,6 +179,7 @@ where
                 let snapshot = self.buffer.save_snapshot();
                 self.buffer.set_range(&command.address)?;
                 self.yank_buffer = Some(self.buffer.delete()?);
+                self.postfix_command = command.suffix;
                 self.snapshot = Some(snapshot);
             }
             CommandKind::InternalListLastAffectedLine => {
@@ -249,8 +254,7 @@ where
             }
             CommandKind::Join => {
                 let snapshot = self.buffer.save_snapshot();
-                self.buffer.set_range(&command.address)?;
-                self.buffer.join()?;
+                self.buffer.join(&command.address)?;
                 self.snapshot = Some(snapshot);
             }
 
@@ -261,16 +265,17 @@ where
                 println!("regex: {:?}", re);
                 println!("substitution: {:?}", sub);
                 println!("flag: {:?}", flag);
+                let snapshot = self.buffer.save_snapshot();
                 let mut global_flag = false;
                 let mut nth = 0;
                 match flag {
-                    Some('g') => global_flag = true,
-                    Some(n @ '1'..='9') => nth = n.to_digit(10).unwrap_or(0),
-                    Some(_n @ '0') => return Err(EdError::InvalidAddress),
+                    Some(f) if f == "g" => global_flag = true,
+                    Some(n) if n == "0" => return Err(EdError::InvalidAddress),
+                    Some(n) => nth = n.parse().unwrap_or(0),
                     _ => {}
                 }
 
-                if self.buffer.last_re.is_none() {
+                if re.is_some() {
                     self.buffer.last_re = re.clone();
                 }
                 let re = re
@@ -278,16 +283,30 @@ where
                     .or(self.buffer.last_re.as_ref())
                     .ok_or(EdError::RegexNotFound)?;
                 let re = Regex::new(&re)?;
+                let last_sub = self.buffer.last_sub.clone();
                 self.buffer.set_range(&command.address)?;
-
-                for line in self.buffer.get_lines_mut()? {
+                let mut success = false;
+                let mut changes = Vec::new();
+                for (line_number, line) in self.buffer.get_lines()?.iter() {
                     let mut last = 0;
                     let mut out = String::new();
                     for (index, cap) in re.captures_iter(&line.clone()).enumerate() {
                         if nth > 0 && index + 1 < nth as usize {
                             continue;
                         }
-                        let chars = sub.iter().map(|v| v.chars()).flatten().collect::<Vec<_>>();
+                        let mut chars = sub.iter().map(|v| v.chars()).flatten().collect::<Vec<_>>();
+                        if chars.len() == 1 && chars[0] == '%' {
+                            if let Some(last_sub) = last_sub.as_ref() {
+                                chars = last_sub
+                                    .iter()
+                                    .map(|v| v.chars())
+                                    .flatten()
+                                    .collect::<Vec<_>>();
+                            } else {
+                                return Err(EdError::NoData);
+                            }
+                        }
+
                         let mut chars = chars.iter().peekable();
                         let m = cap.get(0).ok_or(EdError::RegexNotFound)?;
                         out.push_str(&line[last..m.start()]);
@@ -300,7 +319,7 @@ where
                                         Some('&') => out.push('&'),
                                         Some(d @ '1'..='9') => {
                                             let idx = d.to_digit(10).unwrap_or(0) as usize;
-                                            println!("idx: {idx}");
+                                            // println!("idx: {idx}");
                                             out.push_str(
                                                 cap.get(idx).map(|m| m.as_str()).unwrap_or(""),
                                             );
@@ -313,7 +332,7 @@ where
                             }
                             chars.next();
                         }
-
+                        success |= true;
                         last = m.end();
                         if !global_flag {
                             break;
@@ -321,9 +340,36 @@ where
                     }
 
                     out.push_str(&line[last..]);
-                    *line = out;
+                    for (i, line) in out.split_inclusive('\n').enumerate() {
+                        changes.push((i == 0, line_number, line.to_owned()));
+                    }
                 }
+                if !success {
+                    self.buffer.restore_snapshot(snapshot);
+                    return Err(EdError::RegexNotFound);
+                }
+                println!("changes: {:?}", changes);
+                for (t, i, c) in changes {
+                    if t {
+                        self.buffer.change_line_at(i, c)?;
+                    } else {
+                        self.buffer.append(&c);
+                    }
+                }
+                self.buffer.last_sub = Some(sub);
+                self.postfix_command = command.suffix;
+                self.snapshot = Some(snapshot);
             } // _ => panic!("Unexpected Command"),
+            CommandKind::File(name) => {
+                if let Some(name) = name {
+                    self.print_message(&format!("{}", name))?;
+                    self.current_file = Some(name);
+                } else if let Some(name) = &self.current_file {
+                    self.print_message(&format!("{}", name))?;
+                } else {
+                    return Err(EdError::InvalidFilename);
+                }
+            }
         }
         Ok(())
     }

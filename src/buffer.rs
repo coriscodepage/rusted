@@ -8,7 +8,9 @@ pub struct Buffer {
     lines: Vec<String>,
     last_affected_line: usize,
     line_range: (usize, usize),
+    empty_adjust: isize,
     pub last_re: Option<String>,
+    pub last_sub: Option<Vec<String>>,
 }
 
 impl Buffer {
@@ -17,7 +19,9 @@ impl Buffer {
             lines: Vec::new(),
             last_affected_line: 0,
             line_range: (0, 0),
+            empty_adjust: 0,
             last_re: None,
+            last_sub: None,
         }
     }
 
@@ -42,16 +46,14 @@ impl Buffer {
     }
 
     pub fn set_range(&mut self, address: &Address) -> Result<(), EdError> {
-        // println!("address: {:?}", address);
         self.line_range = self.parse_address(address)?;
-        // println!("set range: {:?}", self.line_range);
         Ok(())
     }
 
     pub fn append(&mut self, line: &str) {
         self.lines.insert(self.last_affected_line, line.to_owned());
+        self.empty_adjust = 0;
         self.last_affected_line += 1;
-        // println!("{:?}", self.lines);
     }
 
     pub fn delete(&mut self) -> Result<Vec<String>, EdError> {
@@ -72,11 +74,25 @@ impl Buffer {
     }
 
     pub fn adj_change(&mut self) -> Result<(), EdError> {
+        self.empty_adjust = 1;
         self.last_affected_line = self
             .line_range
             .0
             .checked_sub(1)
             .ok_or(EdError::InvalidRange)?;
+        Ok(())
+    }
+
+    pub fn change_line_at(&mut self, index: usize, line: String) -> Result<(), EdError> {
+        *self.lines.get_mut(index).ok_or(EdError::InvalidAddress)? = line;
+        Ok(())
+    }
+
+    pub fn exit_mode(&mut self) -> Result<(), EdError> {
+        self.last_affected_line = self
+            .last_affected_line
+            .checked_add_signed(self.empty_adjust)
+            .ok_or(EdError::InvalidAddress)?;
         Ok(())
     }
 
@@ -92,10 +108,8 @@ impl Buffer {
         } else {
             (destination, destination + (to - from))
         };
-        // println!("set range: {:?}", self.line_range);
         self.last_affected_line = self.line_range.0;
         yanked.iter().for_each(|l| self.append(l));
-        // println!("last affected: {}", self.last_affected_line);
         Ok(())
     }
 
@@ -109,12 +123,15 @@ impl Buffer {
         let yanked: Vec<String> = self.get_lines()?.into();
         self.set_mode(address)?;
         yanked.iter().for_each(|l| self.append(l));
-        // println!("last affected: {}", self.last_affected_line);
-
         Ok(())
     }
 
-    pub fn join(&mut self) -> Result<(), EdError> {
+    pub fn join(&mut self, address: &Address) -> Result<(), EdError> {
+        if matches!(address, Address::None) {
+            self.line_range = (self.last_affected_line, self.last_affected_line + 1);
+        } else {
+            self.set_range(address)?;
+        }
         let (from, to) = (
             self.line_range
                 .0
@@ -192,8 +209,6 @@ impl Buffer {
                 let idx = index
                     .map(|v| v.checked_add_signed(*offset).ok_or(EdError::InvalidAddress))
                     .transpose()?;
-                // println!("{:?}", self.forward_search_space().collect::<Vec<_>>());
-                // println!("{:?}", idx);
                 Ok(idx.ok_or(EdError::RegexNotFound)?)
             }
             Line::RegexBackward(body, offset) => {
@@ -209,8 +224,6 @@ impl Buffer {
                 let idx = index
                     .map(|v| v.checked_add_signed(*offset).ok_or(EdError::InvalidAddress))
                     .transpose()?;
-                // println!("{:?}", self.backward_search_space().collect::<Vec<_>>());
-                // println!("{:?}", idx);
                 Ok(idx.ok_or(EdError::RegexNotFound)?)
             }
         }
@@ -299,6 +312,7 @@ impl Buffer {
         for line in self.lines.get(from..=to).ok_or(EdError::InvalidRange)? {
             f.push_str(line);
         }
+        println!("buffer: {:?}", self.lines);
         Ok(f)
     }
 
@@ -328,6 +342,11 @@ impl<'a> BufferView<'a> {
             numbered: false,
             range_start,
         }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &String)> {
+        let start_actual = self.range_start.saturating_sub(1);
+        (start_actual..self.lines.len() + start_actual).zip(self.lines.iter())
     }
 
     pub fn well_defined(mut self) -> Self {

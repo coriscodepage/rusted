@@ -41,13 +41,14 @@ pub trait MultiLineCommand: Debug {
 struct MLCSubstitution {
     re: Option<String>,
     sub: Vec<String>,
-    flag: Option<char>,
+    flag: Option<String>,
     suffix: Option<CommandKind>,
+    separator: char,
     is_done: bool,
 }
 
 impl MLCSubstitution {
-    fn new(re: Option<String>, sub: String) -> Self {
+    fn new(re: Option<String>, sub: String, separator: char) -> Self {
         let mut subs = Vec::new();
         subs.push(sub);
         Self {
@@ -55,6 +56,7 @@ impl MLCSubstitution {
             sub: subs,
             flag: None,
             suffix: None,
+            separator,
             is_done: false,
         }
     }
@@ -86,11 +88,18 @@ impl MultiLineCommand for MLCSubstitution {
         self.sub.push(sub);
         self.flag = parser
             .peek()
-            .filter(|&c| c == '/')
+            .filter(|&c| c == self.separator)
             .map(|_| parser.consume())
             .and_then(|_| parser.peek())
-            .filter(|c| ['g'].contains(c))
-            .map(|_| parser.consume())
+            .map(|c| {
+                if c.is_numeric() {
+                    parser.parse_number().map(|n| format!("{}", n))
+                } else if ['g'].contains(&c) {
+                    Some(String::from(c))
+                } else {
+                    None
+                }
+            })
             .flatten();
 
         if parser.peek().is_some_and(|v| !v.is_ascii_whitespace()) {
@@ -129,7 +138,7 @@ pub enum CommandKind {
     Substitution {
         re: Option<String>,
         sub: Vec<String>,
-        flag: Option<char>,
+        flag: Option<String>,
     },
     Put,
     Join,
@@ -137,6 +146,7 @@ pub enum CommandKind {
     Write(Option<String>),
     Edit(Option<String>),
     Read(Option<String>),
+    File(Option<String>),
     List,
     NumberedList,
     PrintList,
@@ -279,9 +289,10 @@ impl<'a> ParserInternal<'a> {
             'p' => CommandKind::PrintList,
             'd' => CommandKind::Delete,
             'u' => CommandKind::Undo,
-            'w' => CommandKind::Write(self.get_filename()?),
-            'e' => CommandKind::Edit(self.get_filename()?),
-            'r' => CommandKind::Read(self.get_filename()?),
+            'w' => CommandKind::Write(self.parse_filename()?),
+            'e' => CommandKind::Edit(self.parse_filename()?),
+            'r' => CommandKind::Read(self.parse_filename()?),
+            'f' => CommandKind::File(self.parse_filename()?),
             's' => {
                 let separator = self.consume().ok_or(EdError::EndOfInput)?;
                 if separator.is_whitespace() {
@@ -313,6 +324,7 @@ impl<'a> ParserInternal<'a> {
                 } else {
                     self.consume();
                 }
+                let re = if re.is_empty() { None } else { Some(re) };
 
                 let mut sub = String::new();
                 while let Some(c) = self.peek() {
@@ -323,8 +335,7 @@ impl<'a> ParserInternal<'a> {
                                 sub.push('\n');
                                 return Ok((
                                     CommandKind::MultiLineCommand(Box::new(MLCSubstitution::new(
-                                        Some(re),
-                                        sub,
+                                        re, sub, separator,
                                     ))),
                                     None,
                                 ));
@@ -332,7 +343,7 @@ impl<'a> ParserInternal<'a> {
                             sub.push('\\');
                             continue;
                         }
-                    } else if c == '/' || c.is_control() {
+                    } else if c == separator || c.is_control() {
                         break;
                     }
                     self.consume();
@@ -340,14 +351,21 @@ impl<'a> ParserInternal<'a> {
                 }
                 let flag = self
                     .peek()
-                    .filter(|&c| c == '/')
+                    .filter(|&c| c == separator)
                     .map(|_| self.consume())
                     .and_then(|_| self.peek())
-                    .filter(|c| ['g'].contains(c) || c.is_numeric())
-                    .map(|_| self.consume())
+                    .map(|c| {
+                        if c.is_numeric() {
+                            self.parse_number().map(|n| format!("{}", n))
+                        } else if ['g'].contains(&c) {
+                            Some(String::from(c))
+                        } else {
+                            None
+                        }
+                    })
                     .flatten();
                 CommandKind::Substitution {
-                    re: Some(re),
+                    re: re,
                     sub: vec![sub],
                     flag: flag,
                 }
@@ -377,7 +395,7 @@ impl<'a> ParserInternal<'a> {
         }
     }
 
-    fn get_filename(&mut self) -> Result<Option<String>, EdError> {
+    fn parse_filename(&mut self) -> Result<Option<String>, EdError> {
         if self
             .peek()
             .is_some_and(|c| c.is_whitespace() || c.is_control())
@@ -414,8 +432,19 @@ impl<'a> ParserInternal<'a> {
             Some('/') => {
                 self.consume();
                 let mut regex = String::new();
-                while self.peek().is_some_and(|c| c != '/') {
-                    regex.push(self.consume().unwrap_or_default());
+                while let Some(c) = self.peek() {
+                    match c {
+                        '\\' => {
+                            self.consume();
+                            if self.peek().is_some_and(|ch| ch == '/') {
+                                regex.push(self.consume().unwrap_or_default());
+                            } else {
+                                regex.push(c);
+                            }
+                        }
+                        '/' => break,
+                        _ => regex.push(self.consume().unwrap_or_default()),
+                    };
                 }
                 if self.peek().is_some_and(|c| c == '/') {
                     self.consume();
@@ -428,8 +457,19 @@ impl<'a> ParserInternal<'a> {
             Some('?') => {
                 self.consume();
                 let mut regex = String::new();
-                while self.peek().is_some_and(|c| c != '?') {
-                    regex.push(self.consume().unwrap_or_default());
+                while let Some(c) = self.peek() {
+                    match c {
+                        '\\' => {
+                            self.consume();
+                            if self.peek().is_some_and(|ch| ch == '?') {
+                                regex.push(self.consume().unwrap_or_default());
+                            } else {
+                                regex.push(c);
+                            }
+                        }
+                        '?' => break,
+                        _ => regex.push(self.consume().unwrap_or_default()),
+                    };
                 }
                 if self.peek().is_some_and(|c| c == '?') {
                     self.consume();
