@@ -156,6 +156,35 @@ pub enum CommandKind {
     InternalListLastAffectedLine,
 }
 
+impl Clone for CommandKind {
+    fn clone(&self) -> Self {
+        match self {
+            Self::NoOp => Self::NoOp,
+            Self::Quit => Self::Quit,
+            Self::Append => Self::Append,
+            Self::Insert => Self::Insert,
+            Self::Change => Self::Change,
+            Self::Yank => Self::Yank,
+            Self::Delete => Self::Delete,
+            Self::Transfer(arg0) => Self::Transfer(arg0.clone()),
+            Self::MultiLineCommand(_) => panic!("Cannot clone Box<dyn>"),
+            Self::Substitution { re, sub, flag, repeated } => Self::Substitution { re: re.clone(), sub: sub.clone(), flag: flag.clone(), repeated: repeated.clone() },
+            Self::Put => Self::Put,
+            Self::Join => Self::Join,
+            Self::Move(arg0) => Self::Move(arg0.clone()),
+            Self::Write(arg0) => Self::Write(arg0.clone()),
+            Self::Edit(arg0) => Self::Edit(arg0.clone()),
+            Self::Read(arg0) => Self::Read(arg0.clone()),
+            Self::File(arg0) => Self::File(arg0.clone()),
+            Self::List => Self::List,
+            Self::NumberedList => Self::NumberedList,
+            Self::PrintList => Self::PrintList,
+            Self::Undo => Self::Undo,
+            Self::InternalListLastAffectedLine => Self::InternalListLastAffectedLine,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Command {
     pub address: Address,

@@ -445,7 +445,7 @@ where
                     self.buffer.last_flag = remembered_flag;
                 }
                 let run_suffix = if repeated {
-                    if let Some(new_suffix) = suffix {
+                    if let Some(ref new_suffix) = suffix {
                         let toggles_off = matches!(
                             (&new_suffix, &self.buffer.last_suffix),
                             (CommandKind::List, Some(CommandKind::List))
@@ -456,31 +456,23 @@ where
                             self.buffer.last_suffix = None;
                             false
                         } else {
-                            self.buffer.last_suffix = Some(new_suffix);
+                            self.buffer.last_suffix = Some(new_suffix.clone());
                             true
                         }
                     } else {
                         self.buffer.last_suffix.is_some()
                     }
                 } else {
-                    self.buffer.last_suffix = suffix;
+                    self.buffer.last_suffix = suffix.clone();
                     self.buffer.last_suffix.is_some()
                 };
                 if run_suffix {
-                    if matches!(self.buffer.last_suffix, Some(CommandKind::List)) {
-                        self.buffer.set_range(&Address::None)?;
-                        write!(self.writer, "{}", self.buffer.get_lines()?.well_defined())?;
-                    } else if matches!(self.buffer.last_suffix, Some(CommandKind::NumberedList)) {
-                        self.buffer.set_range(&Address::None)?;
-                        write!(self.writer, "{}", self.buffer.get_lines()?.numbered())?;
-                    } else if matches!(self.buffer.last_suffix, Some(CommandKind::PrintList)) {
-                        self.buffer.set_range(&Address::None)?;
-                        write!(self.writer, "{}", self.buffer.get_lines()?)?;
-                    }
+                    self.postfix_command = suffix;
+                } else {
+                    self.postfix_command = None;
                 }
-                self.postfix_command = None;
                 self.snapshot = Some(snapshot);
-            } // _ => panic!("Unexpected Command"),
+            }
             CommandKind::File(name) => {
                 if let Some(name) = name {
                     self.print_message(&format!("{}", name))?;

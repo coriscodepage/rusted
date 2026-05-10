@@ -253,22 +253,6 @@ impl Buffer {
         Ok(BufferView::new(lines, self.line_range.0))
     }
 
-    pub fn get_lines_mut(&mut self) -> Result<impl IntoIterator<Item = &mut String>, EdError> {
-        let (from, to) = (
-            self.line_range
-                .0
-                .checked_sub(1)
-                .ok_or(EdError::InvalidRange)?,
-            self.line_range
-                .1
-                .checked_sub(1)
-                .ok_or(EdError::InvalidRange)?,
-        );
-        let lines = self.lines.get_mut(from..=to).ok_or(EdError::InvalidRange)?;
-        self.last_affected_line = self.line_range.1;
-        Ok(lines.iter_mut())
-    }
-
     fn forward_search_space(&self) -> impl Iterator<Item = (usize, &String)> {
         let len = self.lines.len();
         let start = if len == 0 {
