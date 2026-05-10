@@ -34,7 +34,7 @@ pub enum Line {
 pub trait MultiLineCommand: Debug {
     fn handle_line(&mut self, line: &str) -> Result<(), EdError>;
     fn is_done(&self) -> bool;
-    fn finish(self: Box<Self>) -> Result<CommandKind, EdError>;
+    fn finish(self: Box<Self>) -> Result<(CommandKind, Option<CommandKind>), EdError>;
 }
 
 #[derive(Debug)]
@@ -42,6 +42,7 @@ struct MLCSubstitution {
     re: Option<String>,
     sub: Vec<String>,
     flag: Option<char>,
+    suffix: Option<CommandKind>,
     is_done: bool,
 }
 
@@ -53,6 +54,7 @@ impl MLCSubstitution {
             re,
             sub: subs,
             flag: None,
+            suffix: None,
             is_done: false,
         }
     }
@@ -72,6 +74,8 @@ impl MultiLineCommand for MLCSubstitution {
                         sub.push('\n');
                         continue;
                     }
+                    sub.push(c);
+                    continue;
                 }
             } else if c == '/' || c.is_control() {
                 break;
@@ -85,8 +89,13 @@ impl MultiLineCommand for MLCSubstitution {
             .filter(|&c| c == '/')
             .map(|_| parser.consume())
             .and_then(|_| parser.peek())
-            .filter(|c| ['g', 'l', 'n', 'p'].contains(c));
-        parser.consume();
+            .filter(|c| ['g'].contains(c))
+            .map(|_| parser.consume())
+            .flatten();
+
+        if parser.peek().is_some_and(|v| !v.is_ascii_whitespace()) {
+            self.suffix = Some(parser.parse_suffix()?);
+        }
         Ok(())
     }
 
@@ -94,8 +103,15 @@ impl MultiLineCommand for MLCSubstitution {
         self.is_done
     }
 
-    fn finish(self: Box<Self>) -> Result<CommandKind, EdError> {
-        Ok(CommandKind::Substitution { re: self.re, sub: self.sub, flag: self.flag })
+    fn finish(self: Box<Self>) -> Result<(CommandKind, Option<CommandKind>), EdError> {
+        Ok((
+            CommandKind::Substitution {
+                re: self.re,
+                sub: self.sub,
+                flag: self.flag,
+            },
+            self.suffix,
+        ))
     }
 }
 
@@ -188,9 +204,9 @@ impl Parser {
     ) -> Result<Command, EdError> {
         cmd.handle_line(&line)?;
         if cmd.is_done() {
-            let kind = cmd.finish()?;
+            let (kind, suffix) = cmd.finish()?;
             self.mlc = None;
-            Ok(Command::new(address, kind, None))
+            Ok(Command::new(address, kind, suffix))
         } else {
             self.mlc = Some((cmd, address));
             Ok(Command::empty(CommandKind::NoOP))
@@ -313,6 +329,8 @@ impl<'a> ParserInternal<'a> {
                                     None,
                                 ));
                             }
+                            sub.push('\\');
+                            continue;
                         }
                     } else if c == '/' || c.is_control() {
                         break;
@@ -325,8 +343,9 @@ impl<'a> ParserInternal<'a> {
                     .filter(|&c| c == '/')
                     .map(|_| self.consume())
                     .and_then(|_| self.peek())
-                    .filter(|c| ['g', 'l', 'n', 'p'].contains(c) || c.is_numeric());
-                self.consume();
+                    .filter(|c| ['g'].contains(c) || c.is_numeric())
+                    .map(|_| self.consume())
+                    .flatten();
                 CommandKind::Substitution {
                     re: Some(re),
                     sub: vec![sub],
@@ -340,17 +359,21 @@ impl<'a> ParserInternal<'a> {
         };
 
         if self.peek().is_some_and(|v| !v.is_ascii_whitespace()) {
-            let suffix = match self.consume().unwrap() {
-                'l' => CommandKind::List,
-                'n' => CommandKind::NumberedList,
-                'p' => CommandKind::PrintList,
-                _ => {
-                    return Err(EdError::UnknownCommand);
-                }
-            };
+            let suffix = self.parse_suffix()?;
             Ok((candidate, Some(suffix)))
         } else {
             Ok((candidate, None))
+        }
+    }
+
+    fn parse_suffix(&mut self) -> Result<CommandKind, EdError> {
+        match self.consume().unwrap() {
+            'l' => Ok(CommandKind::List),
+            'n' => Ok(CommandKind::NumberedList),
+            'p' => Ok(CommandKind::PrintList),
+            _ => {
+                return Err(EdError::UnknownCommand);
+            }
         }
     }
 

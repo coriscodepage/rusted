@@ -78,10 +78,12 @@ where
             }
             match repl.flow {
                 CommandFlow::Command => {
-                    repl.command_flow(&line).unwrap(); //.is_err() {
-                    //repl.print_err()?;
-                    //}
-                    repl.run_postfix()?;
+                    if repl.command_flow(&line).is_err() {
+                        repl.print_err()?;
+                    }
+                    if repl.flow != CommandFlow::Input {
+                        repl.run_postfix()?;
+                    }
                 }
                 CommandFlow::Input => repl.input_flow(&line),
             }
@@ -253,29 +255,75 @@ where
             }
 
             CommandKind::NoOP => {}
-            CommandKind::MultiLineCommand(multi_line_command) => todo!(),
+            CommandKind::MultiLineCommand(_) => todo!(),
             CommandKind::Substitution { re, sub, flag } => {
                 println!("address: {:?}", command.address);
                 println!("regex: {:?}", re);
                 println!("substitution: {:?}", sub);
                 println!("flag: {:?}", flag);
+                let mut global_flag = false;
+                let mut nth = 0;
+                match flag {
+                    Some('g') => global_flag = true,
+                    Some(n @ '1'..='9') => nth = n.to_digit(10).unwrap_or(0),
+                    Some(_n @ '0') => return Err(EdError::InvalidAddress),
+                    _ => {}
+                }
+
                 if self.buffer.last_re.is_none() {
-                    self.buffer.last_re = re;
-                } else {
-                    let re = re
-                        .as_ref()
-                        .or(self.buffer.last_re.as_ref())
-                        .ok_or(EdError::RegexNotFound)?;
-                    let re = Regex::new(&re)?;
-                    for line in sub {
-                        if let Some(caps) = re.captures(&line) {
-                            
+                    self.buffer.last_re = re.clone();
+                }
+                let re = re
+                    .as_ref()
+                    .or(self.buffer.last_re.as_ref())
+                    .ok_or(EdError::RegexNotFound)?;
+                let re = Regex::new(&re)?;
+                self.buffer.set_range(&command.address)?;
+
+                for line in self.buffer.get_lines_mut()? {
+                    let mut last = 0;
+                    let mut out = String::new();
+                    for (index, cap) in re.captures_iter(&line.clone()).enumerate() {
+                        if nth > 0 && index + 1 < nth as usize {
+                            continue;
+                        }
+                        let chars = sub.iter().map(|v| v.chars()).flatten().collect::<Vec<_>>();
+                        let mut chars = chars.iter().peekable();
+                        let m = cap.get(0).ok_or(EdError::RegexNotFound)?;
+                        out.push_str(&line[last..m.start()]);
+                        while let Some(&bite) = chars.peek().copied() {
+                            match bite {
+                                '&' => out.push_str(m.as_str()),
+                                '\\' => {
+                                    chars.next();
+                                    match chars.peek().copied() {
+                                        Some('&') => out.push('&'),
+                                        Some(d @ '1'..='9') => {
+                                            let idx = d.to_digit(10).unwrap_or(0) as usize;
+                                            println!("idx: {idx}");
+                                            out.push_str(
+                                                cap.get(idx).map(|m| m.as_str()).unwrap_or(""),
+                                            );
+                                        }
+                                        Some(&ch) => out.push(ch),
+                                        None => out.push('\\'),
+                                    }
+                                }
+                                ch => out.push(ch),
+                            }
+                            chars.next();
+                        }
+
+                        last = m.end();
+                        if !global_flag {
+                            break;
                         }
                     }
-                    
+
+                    out.push_str(&line[last..]);
+                    *line = out;
                 }
-            }
-            // _ => panic!("Unexpected Command"),
+            } // _ => panic!("Unexpected Command"),
         }
         Ok(())
     }
