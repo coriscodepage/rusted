@@ -147,11 +147,15 @@ impl Buffer {
         }
         self.lines.get(from..=to).ok_or(EdError::InvalidRange)?;
         let lines = self.lines.drain(from + 1..=to).collect::<Vec<_>>();
-        self.lines.get_mut(from).map(|v| {
-            lines
-                .iter()
-                .for_each(|l| v.push_str(&l.trim_end_matches('\n')))
-        });
+        if let Some(v) = self.lines.get_mut(from) {
+            let trimmed_len = v.trim_end_matches('\n').len();
+            v.truncate(trimmed_len);
+            for l in &lines {
+                v.push_str(l.trim_end_matches('\n'));
+            }
+        }
+        println!("buffer at: {:?}", self.lines.get(from));
+        self.last_affected_line = from + 1;
         Ok(())
     }
 

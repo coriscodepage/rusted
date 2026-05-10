@@ -89,18 +89,20 @@ impl MultiLineCommand for MLCSubstitution {
         self.flag = parser
             .peek()
             .filter(|&c| c == self.separator)
-            .map(|_| parser.consume())
+            .map(|_| {
+                parser.consume()
+            })
             .and_then(|_| parser.peek())
-            .map(|c| {
+            .and_then(|c| {
                 if c.is_numeric() {
                     parser.parse_number().map(|n| format!("{}", n))
                 } else if ['g'].contains(&c) {
+                    parser.consume();
                     Some(String::from(c))
                 } else {
-                    None
+                    Some("de".to_owned())
                 }
-            })
-            .flatten();
+            });
 
         if parser.peek().is_some_and(|v| !v.is_ascii_whitespace()) {
             self.suffix = Some(parser.parse_suffix()?);
@@ -294,6 +296,7 @@ impl<'a> ParserInternal<'a> {
             'r' => CommandKind::Read(self.parse_filename()?),
             'f' => CommandKind::File(self.parse_filename()?),
             's' => {
+                
                 let separator = self.consume().ok_or(EdError::EndOfInput)?;
                 if separator.is_whitespace() {
                     return Err(EdError::InvalidInput);
@@ -354,16 +357,16 @@ impl<'a> ParserInternal<'a> {
                     .filter(|&c| c == separator)
                     .map(|_| self.consume())
                     .and_then(|_| self.peek())
-                    .map(|c| {
+                    .and_then(|c| {
                         if c.is_numeric() {
                             self.parse_number().map(|n| format!("{}", n))
                         } else if ['g'].contains(&c) {
+                            self.consume();
                             Some(String::from(c))
                         } else {
-                            None
+                            Some("de".to_owned())
                         }
-                    })
-                    .flatten();
+                    });
                 CommandKind::Substitution {
                     re: re,
                     sub: vec![sub],

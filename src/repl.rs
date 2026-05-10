@@ -8,7 +8,7 @@ use regex::Regex;
 
 use crate::{
     buffer::{Buffer, Snapshot},
-    state::{Command, CommandFlow, CommandKind, EdError, Parser},
+    state::{Address, Command, CommandFlow, CommandKind, EdError, Parser},
 };
 
 pub struct Repl<R, W> {
@@ -19,6 +19,7 @@ pub struct Repl<R, W> {
     current_file: Option<String>,
     snapshot: Option<Snapshot>,
     exit_confirm: u32,
+    edit_confirm: u32,
     yank_buffer: Option<Vec<String>>,
     control_flow: ControlFlow<()>,
     reader: R,
@@ -39,6 +40,7 @@ where
             current_file: None,
             snapshot: None,
             exit_confirm: 0,
+            edit_confirm: 0,
             yank_buffer: None,
             control_flow: ControlFlow::Continue(()),
             reader,
@@ -54,6 +56,7 @@ where
         self.current_file = None;
         self.snapshot = None;
         self.exit_confirm = 0;
+        self.edit_confirm = 0;
         self.yank_buffer = None;
         self.control_flow = ControlFlow::Continue(());
     }
@@ -110,12 +113,20 @@ where
         Ok(())
     }
 
+    fn save_snapshot(&mut self) -> Snapshot {
+        self.edit_confirm = 0;
+        self.buffer.save_snapshot()
+    }
+
     fn match_cmd(&mut self, command: Command) -> Result<(), EdError> {
         if !matches!(command.kind, CommandKind::Quit) {
             self.exit_confirm = 0;
         }
         match command.kind {
             CommandKind::Quit => {
+                if !matches!(command.address, Address::None) {
+                    return Err(EdError::InvalidAddress);
+                }
                 self.exit_confirm += 1;
                 if self.snapshot.is_none() || self.exit_confirm == 2 {
                     self.control_flow = ControlFlow::Break(());
@@ -124,14 +135,14 @@ where
                 }
             }
             CommandKind::Append => {
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 self.buffer.set_mode(&command.address)?;
                 self.postfix_command = command.suffix;
                 self.flow = CommandFlow::Input;
                 self.snapshot = Some(snapshot);
             }
             CommandKind::Change => {
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 self.postfix_command = command.suffix;
                 self.buffer.set_range(&command.address)?;
                 self.yank_buffer = Some(self.buffer.delete()?);
@@ -156,16 +167,21 @@ where
                 self.print_message(&format!("{}", length))?;
             }
             CommandKind::Edit(name) => {
-                let name = name
-                    .or(self.current_file.take())
-                    .ok_or(EdError::InvalidFilename)?;
-                let mut file = File::open(&name)?;
-                let mut contents = String::new();
-                file.read_to_string(&mut contents)?;
-                self.reset();
-                self.current_file = Some(name);
-                contents.lines().for_each(|l| self.buffer.append(l));
-                self.print_message(&format!("{}", contents.len()))?;
+                self.edit_confirm += 1;
+                if self.snapshot.is_none() || self.edit_confirm == 2 {
+                    let name = name
+                        .or(self.current_file.take())
+                        .ok_or(EdError::InvalidFilename)?;
+                    let mut file = File::open(&name)?;
+                    let mut contents = String::new();
+                    file.read_to_string(&mut contents)?;
+                    self.reset();
+                    self.current_file = Some(name);
+                    contents.lines().for_each(|l| self.buffer.append(l));
+                    self.print_message(&format!("{}", contents.len()))?;
+                } else {
+                    return Err(EdError::EndOfInput);
+                }
             }
             CommandKind::List => {
                 self.buffer.set_range(&command.address)?;
@@ -176,7 +192,7 @@ where
                 write!(self.writer, "{}", self.buffer.get_lines()?.numbered())?;
             }
             CommandKind::Delete => {
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 self.buffer.set_range(&command.address)?;
                 self.yank_buffer = Some(self.buffer.delete()?);
                 self.postfix_command = command.suffix;
@@ -187,8 +203,11 @@ where
                 write!(self.writer, "{}", self.buffer.get_active_line()?)?;
             }
             CommandKind::Undo => {
+                if !matches!(command.address, Address::None) {
+                    return Err(EdError::InvalidAddress);
+                }
                 if let Some(restore) = self.snapshot.take() {
-                    let snapshot = self.buffer.save_snapshot();
+                    let snapshot = self.save_snapshot();
                     self.buffer.restore_snapshot(restore);
                     self.snapshot = Some(snapshot);
                     self.postfix_command = command.suffix;
@@ -207,10 +226,11 @@ where
 
                 let name = name
                     .as_ref()
-                    .or(self.current_file.as_ref())
+                    .cloned()
+                    .or_else(|| self.current_file.clone())
                     .ok_or(EdError::InvalidFilename)?;
-                let snapshot = self.buffer.save_snapshot();
-                let mut file = File::open(name)?;
+                let snapshot = self.save_snapshot();
+                let mut file = File::open(&name)?;
                 let mut contents = String::new();
                 file.read_to_string(&mut contents)?;
                 self.buffer.set_mode(&command.address)?;
@@ -219,7 +239,7 @@ where
                 self.print_message(&format!("{}", contents.len()))?;
             }
             CommandKind::Insert => {
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 self.buffer.set_mode_insert(&command.address)?;
                 self.postfix_command = command.suffix;
                 self.flow = CommandFlow::Input;
@@ -231,14 +251,15 @@ where
                 self.yank_buffer = Some(yanked);
             }
             CommandKind::Transfer(address) => {
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 self.buffer.set_range(&command.address)?;
                 self.buffer.transfer(&address)?;
                 self.snapshot = Some(snapshot);
             }
             CommandKind::Put => {
-                if let Some(yank_buffer) = &self.yank_buffer {
-                    let snapshot = self.buffer.save_snapshot();
+                if self.yank_buffer.is_some() {
+                    let yank_buffer = self.yank_buffer.clone().unwrap();
+                    let snapshot = self.save_snapshot();
                     self.buffer.set_mode(&command.address)?;
                     yank_buffer.iter().for_each(|l| self.buffer.append(l));
                     self.snapshot = Some(snapshot);
@@ -247,13 +268,13 @@ where
                 }
             }
             CommandKind::Move(address) => {
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 self.buffer.set_range(&command.address)?;
                 self.buffer.move_to(&address)?;
                 self.snapshot = Some(snapshot);
             }
             CommandKind::Join => {
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 self.buffer.join(&command.address)?;
                 self.snapshot = Some(snapshot);
             }
@@ -261,18 +282,24 @@ where
             CommandKind::NoOP => {}
             CommandKind::MultiLineCommand(_) => todo!(),
             CommandKind::Substitution { re, sub, flag } => {
+                let mut suffix = command.suffix;
                 println!("address: {:?}", command.address);
+                println!("postfix: {:?}", suffix);
                 println!("regex: {:?}", re);
                 println!("substitution: {:?}", sub);
                 println!("flag: {:?}", flag);
-                let snapshot = self.buffer.save_snapshot();
+                let snapshot = self.save_snapshot();
                 let mut global_flag = false;
                 let mut nth = 0;
                 match flag {
                     Some(f) if f == "g" => global_flag = true,
                     Some(n) if n == "0" => return Err(EdError::InvalidAddress),
                     Some(n) => nth = n.parse().unwrap_or(0),
-                    _ => {}
+                    None => {
+                        if suffix.is_none() {
+                            suffix = Some(CommandKind::PrintList)
+                        }
+                    }
                 }
 
                 if re.is_some() {
@@ -357,7 +384,7 @@ where
                     }
                 }
                 self.buffer.last_sub = Some(sub);
-                self.postfix_command = command.suffix;
+                self.postfix_command = suffix;
                 self.snapshot = Some(snapshot);
             } // _ => panic!("Unexpected Command"),
             CommandKind::File(name) => {
