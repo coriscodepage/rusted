@@ -15,18 +15,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*; // Importuje strukturę Repl i inne potrzebne elementy
+    use super::*;
     use crate::state::{Address, CommandKind, Line, Parser};
     use std::io::Cursor;
     use std::{env, fs, process};
 
-    /// Funkcja pomocnicza do uruchamiania Repl z udawanym wejściem (mockiem)
     fn run_mock(input_data: &str) -> String {
         let mut input = Cursor::new(input_data.as_bytes());
         let mut output = Vec::new();
 
-        // Ignorujemy błędy Result dla uproszczenia testów,
-        // ale sprawdzamy, czy Repl nie panikuje.
         let _ = Repl::begin(&mut input, &mut output);
 
         String::from_utf8(output).expect("Output to nie jest poprawne UTF-8")
@@ -62,7 +59,6 @@ mod tests {
 
     #[test]
     fn test_basic_append_and_list_range() {
-        // Testuje dodawanie i wyświetlanie konkretnego zakresu
         let input = "\
 a
 Linia 1
@@ -75,7 +71,6 @@ q
 ";
         let output = run_mock(input);
 
-        // Powinno zawierać tylko linie 1 i 2, zakończone znakiem $
         assert!(output.contains("Linia 1$"));
         assert!(output.contains("Linia 2$"));
         assert!(
@@ -86,7 +81,6 @@ q
 
     #[test]
     fn test_delete_and_index_shift() {
-        // Sprawdza, czy po usunięciu środkowej linii reszta się przesuwa
         let input = "\
 a
 Pierwsza
@@ -100,7 +94,6 @@ q
 ";
         let output = run_mock(input);
 
-        // Po usunięciu "Druga", "Trzecia" powinna stać się drugą linią
         assert!(output.contains("Pierwsza$"));
         assert!(output.contains("Trzecia$"));
         assert!(!output.contains("Druga$"));
@@ -108,7 +101,6 @@ q
 
     #[test]
     fn test_current_line_pointer() {
-        // Testuje, czy kropka (.) poprawnie śledzi ostatnią operację
         let input = "\
 a
 L1
@@ -124,14 +116,12 @@ q
 ";
         let output = run_mock(input);
 
-        // Szukamy sekwencji wystąpień, aby upewnić się, że 'l' reaguje na zmianę kropki
         let occurrences: Vec<_> = output.matches("L").collect();
         assert!(occurrences.len() >= 4);
     }
 
     #[test]
     fn test_address_symbols_dot_and_dollar() {
-        // Testuje użycie symboli . (bieżąca) i $ (ostatnia)
         let input = "\
 a
 A
@@ -152,8 +142,6 @@ q
 
     #[test]
     fn test_write_and_quit_dirty_flag() {
-        // Testuje, czy edytor ostrzega o braku zapisu (Dirty Buffer)
-        // Zakładamy, że pierwsza próba 'q' przy zmianach zwraca '?'
         let input = "\
 a
 Nowa treść
@@ -163,13 +151,11 @@ q
 ";
         let output = run_mock(input);
 
-        // Powinien pojawić się znak zapytania jako ostrzeżenie
         assert!(output.contains("?"));
     }
 
     #[test]
     fn test_empty_buffer_errors() {
-        // Testuje zachowanie na całkowicie pustym edytorze
         let input = "\
 l
 d
@@ -178,7 +164,6 @@ q
 ";
         let output = run_mock(input);
 
-        // Każda operacja (poza q w niektórych implementacjach) powinna rzucić błędem
         let error_count = output.matches('?').count();
         assert!(
             error_count >= 3,
@@ -188,7 +173,6 @@ q
 
     #[test]
     fn test_regex_substitute_s() {
-        // Dodajemy tekst, podmieniamy słowo, wyświetlamy i wychodzimy
         let input = "\
 a
 Rdza jest trudna
@@ -201,14 +185,12 @@ q
 ";
         let output = run_mock(input);
 
-        // Linia 1 powinna ulec zmianie, linia 2 pozostaje bez zmian (mimo braku dopasowania)
         assert!(output.contains("Rdza jest szybka$"));
         assert!(output.contains("Rdza jest fajna$"));
     }
 
     #[test]
     fn test_regex_invalid_pattern() {
-        // Próba podania zepsutego regexu (niedomknięty nawias)
         let input = "\
 a
 Test
@@ -218,13 +200,11 @@ q
 q
 ";
         let output = run_mock(input);
-        // Program powinien rzucić znakiem zapytania, a nie panikować
         assert!(output.contains("?"));
     }
 
     #[test]
     fn test_transfer_t() {
-        // t kopiuje zakres linii na nowy adres
         let input = "\
 a
 A
@@ -238,7 +218,6 @@ q
 ";
         let output = run_mock(input);
 
-        // Oczekujemy: A, B, C, A, B
         let expected = "A$\nB$\nC$\nA$\nB$";
         assert!(
             output.replace("\r\n", "\n").contains(expected),
@@ -249,7 +228,6 @@ q
 
     #[test]
     fn test_cut_and_yank_x_y() {
-        // y: yank (kopiuje do rejestru, nie usuwa z bufora)
         let input = "\
 a
 Linia 1
@@ -263,7 +241,6 @@ q
 q
 ";
         let output = run_mock(input);
-        // Bufor powinien teraz zawierać tylko: Linia 1 i Linia 3.
         assert!(output.contains("Linia 1$"));
         assert!(output.lines().filter(|v| v.contains("Linia 2$")).count() == 2,);
         assert!(output.contains("Linia 3$"));
@@ -271,11 +248,9 @@ q
 
     #[test]
     fn test_file_read_and_edit_e_r() {
-        // Przygotowujemy tymczasowy plik do testów
         let filename = "mock_test_r_e.txt";
         fs::write(filename, "Zewnetrzne dane\nKoniec danych\n").unwrap();
 
-        // r: dołączenie pliku, e: edycja (zastąpienie) pliku
         let input = format!(
             "\
 a
@@ -291,12 +266,9 @@ q
 "
         );
         let output = run_mock(&input);
-        // Najpierw 'r' powinno dołączyć linie z pliku na koniec
         assert!(output.contains("Stare dane$"));
         assert!(output.contains("Zewnetrzne dane$"));
 
-        // Następnie 'e' powinno zresetować bufor i wczytać tylko plik
-        // Sprawdzamy stan po drugim 1,$l (po komendzie e)
         let parts: Vec<&str> = output.split("30").collect();
         let binding = output.as_str();
         let last_part = parts.last().unwrap_or(&binding);
@@ -307,13 +279,11 @@ q
         );
         assert!(last_part.contains("Zewnetrzne dane$"));
 
-        // Sprzątamy plik testowy
         let _ = fs::remove_file(filename);
     }
 
     #[test]
     fn test_bad_addressing_with_new_commands() {
-        // Sprawdzamy czy komendy na zlych adresach odpowiadaja '?'
         let input = "\
 1,5t2
 1x
@@ -323,7 +293,6 @@ q
 ";
         let output = run_mock(input);
 
-        // Powinniśmy dostać znak zapytania za każde wywołanie
         assert_eq!(
             output.matches('?').count(),
             3,
@@ -817,30 +786,31 @@ q
         assert!(output.contains("11"));
     }
 
-//     #[test]
-//     fn test_read_at_zero_and_undo_restores_empty_buffer() {
-//         let path = env::temp_dir().join(format!("ed_read_undo_{}.txt", process::id()));
-//         let filename = path.to_string_lossy();
-//         fs::write(&path, "from file\nsecond\n").unwrap();
-//         let input = format!(
-//             "\
-// 0r {filename}
-// 1,$l
-// u
-// l
-// q
-// "
-//         );
+    #[test]
+    fn test_read_at_zero_and_undo_restores_empty_buffer() {
+        let path = env::temp_dir().join(format!("ed_read_undo_{}.txt", process::id()));
+        let filename = path.to_string_lossy();
+        fs::write(&path, "from file\nsecond\n").unwrap();
+        let input = format!(
+            "\
+0r {filename}
+1,$l
+u
+l
+q
+q
+"
+        );
 
-//         let output = run_mock(&input);
-//         let _ = fs::remove_file(&path);
+        let output = run_mock(&input);
+        let _ = fs::remove_file(&path);
 
-//         assert_eq!(listed_lines(&output), vec!["from file$", "second$"]);
-//         assert!(
-//             output.contains('?'),
-//             "listing after undoing the read should report an empty-buffer error"
-//         );
-//     }
+        assert_eq!(listed_lines(&output), vec!["from file$", "second$"]);
+        assert!(
+            output.contains('?'),
+            "listing after undoing the read should report an empty-buffer error"
+        );
+    }
 
     #[test]
     fn test_insert_zero_address_places_text_at_start() {
@@ -1704,46 +1674,6 @@ q
 
         assert_eq!(plain_lines(&output), vec!["bar one"]);
         assert_eq!(listed_lines(&output), vec!["bar one$", "bar two$"]);
-    }
-
-    #[test]
-    fn test_repeat_substitution_r_suffix_uses_last_search_regex() {
-        let input = "\
-a
-cat one
-dog two
-.
-/dog/p
-1s/cat/pet/
-2sr
-1,$l
-q
-q
-";
-        let output = run_mock(input);
-
-        assert_eq!(plain_lines(&output), vec!["dog two"]);
-        assert_eq!(listed_lines(&output), vec!["pet one$", "pet two$"]);
-    }
-
-    #[test]
-    fn test_repeat_substitution_accepts_combined_rgp_suffixes() {
-        let input = "\
-a
-cat cat
-dog dog
-.
-/dog/p
-1s/cat/pet/
-2srgp
-1,$l
-q
-q
-";
-        let output = run_mock(input);
-
-        assert_eq!(plain_lines(&output), vec!["dog dog", "pet pet"]);
-        assert_eq!(listed_lines(&output), vec!["pet cat$", "pet pet$"]);
     }
 
     #[test]

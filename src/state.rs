@@ -89,9 +89,7 @@ impl MultiLineCommand for MLCSubstitution {
         self.flag = parser
             .peek()
             .filter(|&c| c == self.separator)
-            .map(|_| {
-                parser.consume()
-            })
+            .map(|_| parser.consume())
             .and_then(|_| parser.peek())
             .and_then(|c| {
                 if c.is_numeric() {
@@ -120,6 +118,7 @@ impl MultiLineCommand for MLCSubstitution {
                 re: self.re,
                 sub: self.sub,
                 flag: self.flag,
+                repeated: false,
             },
             self.suffix,
         ))
@@ -128,7 +127,7 @@ impl MultiLineCommand for MLCSubstitution {
 
 #[derive(Debug)]
 pub enum CommandKind {
-    NoOP,
+    NoOp,
     Quit,
     Append,
     Insert,
@@ -141,6 +140,7 @@ pub enum CommandKind {
         re: Option<String>,
         sub: Vec<String>,
         flag: Option<String>,
+        repeated: bool,
     },
     Put,
     Join,
@@ -202,7 +202,7 @@ impl Parser {
             Err(EdError::UnknownCommand)
         } else if let CommandKind::MultiLineCommand(cmd) = kind {
             self.mlc = Some((cmd, address));
-            Ok(Command::empty(CommandKind::NoOP))
+            Ok(Command::empty(CommandKind::NoOp))
         } else {
             Ok(Command::new(address, kind, suffix))
         }
@@ -221,7 +221,7 @@ impl Parser {
             Ok(Command::new(address, kind, suffix))
         } else {
             self.mlc = Some((cmd, address));
-            Ok(Command::empty(CommandKind::NoOP))
+            Ok(Command::empty(CommandKind::NoOp))
         }
     }
 }
@@ -296,81 +296,24 @@ impl<'a> ParserInternal<'a> {
             'r' => CommandKind::Read(self.parse_filename()?),
             'f' => CommandKind::File(self.parse_filename()?),
             's' => {
-                
-                let separator = self.consume().ok_or(EdError::EndOfInput)?;
-                if separator.is_whitespace() {
-                    return Err(EdError::InvalidInput);
-                }
-                let mut re = String::new();
-                while let Some(c) = self.peek() {
-                    if c == '\\' {
-                        self.consume();
-                        if let Some(v) = self.peek() {
-                            if v == separator {
-                                self.consume();
-                                re.push(v);
-                                continue;
-                            } else if v == '\\' {
-                                self.consume();
-                                re.push(v);
-                                continue;
-                            }
-                        }
-                    } else if c == separator {
-                        break;
+                let mut working_copy = self.chars.clone();
+                let (re, sub, flag) = match self.parse_full_subs() {
+                    Ok(o) => match o {
+                        (None, Some(v)) => v,
+                        (Some(r), None) => return Ok((r, None)),
+                        _ => return Err(EdError::UnexpectedState),
+                    },
+                    Err(_) => {
+                        let ret = self.parse_short_subs(&mut working_copy)?;
+                        while let Some(_) = self.consume() {}
+                        return Ok((ret.0, ret.1));
                     }
-                    self.consume();
-                    re.push(c);
-                }
-                if self.peek().is_none_or(|c| c != separator) {
-                    return Err(EdError::EndOfInput);
-                } else {
-                    self.consume();
-                }
-                let re = if re.is_empty() { None } else { Some(re) };
-
-                let mut sub = String::new();
-                while let Some(c) = self.peek() {
-                    if c == '\\' {
-                        self.consume();
-                        if let Some(v) = self.peek() {
-                            if v == '\n' {
-                                sub.push('\n');
-                                return Ok((
-                                    CommandKind::MultiLineCommand(Box::new(MLCSubstitution::new(
-                                        re, sub, separator,
-                                    ))),
-                                    None,
-                                ));
-                            }
-                            sub.push('\\');
-                            continue;
-                        }
-                    } else if c == separator || c.is_control() {
-                        break;
-                    }
-                    self.consume();
-                    sub.push(c);
-                }
-                let flag = self
-                    .peek()
-                    .filter(|&c| c == separator)
-                    .map(|_| self.consume())
-                    .and_then(|_| self.peek())
-                    .and_then(|c| {
-                        if c.is_numeric() {
-                            self.parse_number().map(|n| format!("{}", n))
-                        } else if ['g'].contains(&c) {
-                            self.consume();
-                            Some(String::from(c))
-                        } else {
-                            Some("de".to_owned())
-                        }
-                    });
+                };
                 CommandKind::Substitution {
                     re: re,
                     sub: vec![sub],
                     flag: flag,
+                    repeated: false,
                 }
             }
             c if c.is_ascii_whitespace() => CommandKind::InternalListLastAffectedLine,
@@ -387,15 +330,155 @@ impl<'a> ParserInternal<'a> {
         }
     }
 
-    fn parse_suffix(&mut self) -> Result<CommandKind, EdError> {
-        match self.consume().unwrap() {
-            'l' => Ok(CommandKind::List),
-            'n' => Ok(CommandKind::NumberedList),
-            'p' => Ok(CommandKind::PrintList),
-            _ => {
-                return Err(EdError::UnknownCommand);
+    fn parse_short_subs(
+        &self,
+        chars: &mut Peekable<Chars>,
+    ) -> Result<(CommandKind, Option<CommandKind>), EdError> {
+        let mut flag = None;
+        let mut suffix = None;
+
+        match chars.peek().copied() {
+            None => {}
+            Some('\n') => {}
+            Some(c) if c.is_ascii_whitespace() => return Err(EdError::InvalidInput),
+            Some(c) if c.is_ascii_digit() => {
+                let mut s = String::new();
+                while matches!(chars.peek(), Some(d) if d.is_ascii_digit()) {
+                    s.push(chars.next().unwrap());
+                }
+                flag = Some(s);
             }
+            Some('g') => {
+                chars.next();
+                flag = Some("g".to_owned());
+            }
+            Some('l') | Some('n') | Some('p') => {
+                suffix = Self::parse_print_suffix_char(chars.next().unwrap());
+            }
+            Some(_) => return Err(EdError::UnknownCommand),
         }
+
+        if suffix.is_none() {
+            suffix = match chars.peek().copied() {
+                Some('l') | Some('n') | Some('p') => {
+                    Self::parse_print_suffix_char(chars.next().unwrap())
+                }
+                _ => None,
+            };
+        }
+
+        while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
+            chars.next();
+        }
+
+        if chars.peek().is_some() {
+            return Err(EdError::UnknownCommand);
+        }
+
+        Ok((
+            CommandKind::Substitution {
+                re: None,
+                sub: vec![],
+                flag,
+                repeated: true,
+            },
+            suffix,
+        ))
+    }
+
+    fn parse_print_suffix_char(c: char) -> Option<CommandKind> {
+        match c {
+            'l' => Some(CommandKind::List),
+            'n' => Some(CommandKind::NumberedList),
+            'p' => Some(CommandKind::PrintList),
+            _ => None,
+        }
+    }
+
+    fn parse_full_subs(
+        &mut self,
+    ) -> Result<
+        (
+            Option<CommandKind>,
+            Option<(Option<String>, String, Option<String>)>,
+        ),
+        EdError,
+    > {
+        let separator = self.consume().ok_or(EdError::EndOfInput)?;
+        if separator.is_whitespace() {
+            return Err(EdError::InvalidInput);
+        }
+        let mut re = String::new();
+        while let Some(c) = self.peek() {
+            if c == '\\' {
+                self.consume();
+                if let Some(v) = self.peek() {
+                    if v == separator {
+                        self.consume();
+                        re.push(v);
+                        continue;
+                    } else if v == '\\' {
+                        self.consume();
+                        re.push(v);
+                        continue;
+                    }
+                }
+            } else if c == separator {
+                break;
+            }
+            self.consume();
+            re.push(c);
+        }
+        if self.peek().is_none_or(|c| c != separator) {
+            return Err(EdError::EndOfInput);
+        } else {
+            self.consume();
+        }
+        let re = if re.is_empty() { None } else { Some(re) };
+
+        let mut sub = String::new();
+        while let Some(c) = self.peek() {
+            if c == '\\' {
+                self.consume();
+                if let Some(v) = self.peek() {
+                    if v == '\n' {
+                        sub.push('\n');
+                        return Ok((
+                            Some(CommandKind::MultiLineCommand(Box::new(
+                                MLCSubstitution::new(re, sub, separator),
+                            ))),
+                            None,
+                        ));
+                    }
+                    sub.push('\\');
+                    continue;
+                }
+            } else if c == separator || c.is_control() {
+                break;
+            }
+            self.consume();
+            sub.push(c);
+        }
+        let flag = self
+            .peek()
+            .filter(|&c| c == separator)
+            .map(|_| self.consume())
+            .and_then(|_| self.peek())
+            .and_then(|c| {
+                if c.is_numeric() {
+                    self.parse_number().map(|n| format!("{}", n))
+                } else if ['g'].contains(&c) {
+                    self.consume();
+                    Some(String::from(c))
+                } else {
+                    Some("de".to_owned())
+                }
+            });
+        Ok((None, Some((re, sub, flag))))
+    }
+
+    fn parse_suffix(&mut self) -> Result<CommandKind, EdError> {
+        Self::parse_print_suffix_char(self.consume().ok_or(EdError::EndOfInput)?).ok_or(EdError::UnknownCommand)
     }
 
     fn parse_filename(&mut self) -> Result<Option<String>, EdError> {
@@ -559,6 +642,7 @@ pub enum EdError {
     RegexNotFound,
     RegexInvalid,
     EndOfInput,
+    UnexpectedState,
     IoError(io::Error),
     RegexError(regex::Error),
 }
@@ -578,6 +662,7 @@ impl Display for EdError {
             EdError::NoData => "No Data".to_owned(),
             EdError::EndOfInput => "End Of Input".to_owned(),
             EdError::InvalidInput => "Invalid Input".to_owned(),
+            EdError::UnexpectedState => "Unexpected State".to_owned(),
         };
         write!(f, "{}", message)
     }

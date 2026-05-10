@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use regex::Regex;
 
-use crate::state::{Address, EdError, Line};
+use crate::state::{Address, CommandKind, EdError, Line};
 
 pub struct Buffer {
     lines: Vec<String>,
@@ -11,6 +11,8 @@ pub struct Buffer {
     empty_adjust: isize,
     pub last_re: Option<String>,
     pub last_sub: Option<Vec<String>>,
+    pub last_flag: Option<String>,
+    pub last_suffix: Option<CommandKind>,
 }
 
 impl Buffer {
@@ -22,6 +24,8 @@ impl Buffer {
             empty_adjust: 0,
             last_re: None,
             last_sub: None,
+            last_flag: None,
+            last_suffix: None,
         }
     }
 

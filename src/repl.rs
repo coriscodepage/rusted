@@ -279,103 +279,160 @@ where
                 self.snapshot = Some(snapshot);
             }
 
-            CommandKind::NoOP => {}
+            CommandKind::NoOp => {}
             CommandKind::MultiLineCommand(_) => todo!(),
-            CommandKind::Substitution { re, sub, flag } => {
+            CommandKind::Substitution {
+                re,
+                mut sub,
+                flag,
+                repeated,
+            } => {
                 let mut suffix = command.suffix;
-                println!("address: {:?}", command.address);
-                println!("postfix: {:?}", suffix);
-                println!("regex: {:?}", re);
-                println!("substitution: {:?}", sub);
-                println!("flag: {:?}", flag);
                 let snapshot = self.save_snapshot();
                 let mut global_flag = false;
                 let mut nth = 0;
-                match flag {
-                    Some(f) if f == "g" => global_flag = true,
-                    Some(n) if n == "0" => return Err(EdError::InvalidAddress),
-                    Some(n) => nth = n.parse().unwrap_or(0),
-                    None => {
-                        if suffix.is_none() {
-                            suffix = Some(CommandKind::PrintList)
+                let mut remembered_flag = None;
+                let mut update_remembered_flag = false;
+
+                if repeated {
+                    match flag {
+                        Some(f) if f == "g" => {
+                            update_remembered_flag = true;
+                            if self.buffer.last_flag.as_deref() == Some("g") {
+                                remembered_flag = Some(String::from("de"));
+                            } else {
+                                remembered_flag = Some(f);
+                                global_flag = true;
+                            }
+                        }
+                        Some(f) if f == "0" => return Err(EdError::InvalidAddress),
+                        Some(f) => {
+                            update_remembered_flag = true;
+                            nth = f.parse().unwrap_or(0);
+                            remembered_flag = Some(f);
+                        }
+                        None => match self.buffer.last_flag.as_deref() {
+                            Some("g") => global_flag = true,
+                            Some(n) => nth = n.parse().unwrap_or(0),
+                            None => {}
+                        },
+                    }
+                } else {
+                    match flag {
+                        Some(f) if f == "g" => {
+                            update_remembered_flag = true;
+                            remembered_flag = Some(f);
+                            global_flag = true;
+                        }
+                        Some(f) if f == "0" => return Err(EdError::InvalidAddress),
+                        Some(f) => {
+                            update_remembered_flag = true;
+                            nth = f.parse().unwrap_or(0);
+                            remembered_flag = Some(f);
+                        }
+                        None => {
+                            update_remembered_flag = true;
+                            remembered_flag = Some(String::from("de"));
+                            if suffix.is_none() {
+                                suffix = Some(CommandKind::PrintList)
+                            }
                         }
                     }
                 }
 
-                if re.is_some() {
-                    self.buffer.last_re = re.clone();
-                }
-                let re = re
-                    .as_ref()
-                    .or(self.buffer.last_re.as_ref())
-                    .ok_or(EdError::RegexNotFound)?;
-                let re = Regex::new(&re)?;
-                let last_sub = self.buffer.last_sub.clone();
+                let re = match re {
+                    Some(re) => {
+                        self.buffer.last_re = Some(re);
+                        self.buffer
+                            .last_re
+                            .as_deref()
+                            .ok_or(EdError::RegexNotFound)?
+                    }
+                    None => self
+                        .buffer
+                        .last_re
+                        .as_deref()
+                        .ok_or(EdError::RegexNotFound)?,
+                };
+                let re = Regex::new(re)?;
                 self.buffer.set_range(&command.address)?;
+                let mut previous_sub = self.buffer.last_sub.take();
+                if repeated {
+                    sub = previous_sub.take().ok_or(EdError::NoData)?;
+                }
+                let use_previous_sub = sub.len() == 1 && sub[0] == "%";
+                if use_previous_sub && !repeated && previous_sub.is_none() {
+                    self.buffer.last_sub = previous_sub;
+                    return Err(EdError::NoData);
+                }
+
                 let mut success = false;
                 let mut changes = Vec::new();
-                for (line_number, line) in self.buffer.get_lines()?.iter() {
-                    let mut last = 0;
-                    let mut out = String::new();
-                    for (index, cap) in re.captures_iter(&line.clone()).enumerate() {
-                        if nth > 0 && index + 1 < nth as usize {
-                            continue;
-                        }
-                        let mut chars = sub.iter().map(|v| v.chars()).flatten().collect::<Vec<_>>();
-                        if chars.len() == 1 && chars[0] == '%' {
-                            if let Some(last_sub) = last_sub.as_ref() {
-                                chars = last_sub
-                                    .iter()
-                                    .map(|v| v.chars())
-                                    .flatten()
-                                    .collect::<Vec<_>>();
-                            } else {
-                                return Err(EdError::NoData);
-                            }
-                        }
 
-                        let mut chars = chars.iter().peekable();
-                        let m = cap.get(0).ok_or(EdError::RegexNotFound)?;
-                        out.push_str(&line[last..m.start()]);
-                        while let Some(&bite) = chars.peek().copied() {
-                            match bite {
-                                '&' => out.push_str(m.as_str()),
-                                '\\' => {
-                                    chars.next();
-                                    match chars.peek().copied() {
-                                        Some('&') => out.push('&'),
-                                        Some(d @ '1'..='9') => {
-                                            let idx = d.to_digit(10).unwrap_or(0) as usize;
-                                            // println!("idx: {idx}");
-                                            out.push_str(
-                                                cap.get(idx).map(|m| m.as_str()).unwrap_or(""),
-                                            );
-                                        }
-                                        Some(&ch) => out.push(ch),
-                                        None => out.push('\\'),
-                                    }
+                {
+                    let replacement = if use_previous_sub {
+                        previous_sub.as_deref().unwrap_or(sub.as_slice())
+                    } else {
+                        sub.as_slice()
+                    };
+
+                    let lines = match self.buffer.get_lines() {
+                        Ok(lines) => lines,
+                        Err(e) => {
+                            self.buffer.last_sub = if repeated { Some(sub) } else { previous_sub };
+                            return Err(e);
+                        }
+                    };
+
+                    for (line_number, line) in lines.iter() {
+                        let mut last = 0;
+                        let mut out = String::new();
+                        for (index, cap) in re.captures_iter(line.as_str()).enumerate() {
+                            if nth > 0 && index + 1 < nth as usize {
+                                continue;
+                            }
+
+                            let m = cap.get(0).unwrap();
+                            out.push_str(&line[last..m.start()]);
+                            for part in replacement {
+                                let mut chars = part.chars();
+                                while let Some(bite) = chars.next() {
+                                    match bite {
+                                        '&' => out.push_str(m.as_str()),
+                                        '\\' => match chars.next() {
+                                            Some('&') => out.push('&'),
+                                            Some(d @ '1'..='9') => {
+                                                let idx = d.to_digit(10).unwrap_or(0) as usize;
+                                                out.push_str(
+                                                    cap.get(idx).map(|m| m.as_str()).unwrap_or(""),
+                                                );
+                                            }
+                                            Some(ch) => out.push(ch),
+                                            None => out.push('\\'),
+                                        },
+                                        ch => out.push(ch),
+                                    };
                                 }
-                                ch => out.push(ch),
                             }
-                            chars.next();
+                            success |= true;
+                            last = m.end();
+                            if !global_flag {
+                                break;
+                            }
                         }
-                        success |= true;
-                        last = m.end();
-                        if !global_flag {
-                            break;
-                        }
-                    }
 
-                    out.push_str(&line[last..]);
-                    for (i, line) in out.split_inclusive('\n').enumerate() {
-                        changes.push((i == 0, line_number, line.to_owned()));
+                        out.push_str(&line[last..]);
+                        for (i, line) in out.split_inclusive('\n').enumerate() {
+                            changes.push((i == 0, line_number, String::from(line)));
+                        }
                     }
                 }
+
                 if !success {
                     self.buffer.restore_snapshot(snapshot);
+                    self.buffer.last_sub = if repeated { Some(sub) } else { previous_sub };
                     return Err(EdError::RegexNotFound);
                 }
-                println!("changes: {:?}", changes);
                 for (t, i, c) in changes {
                     if t {
                         self.buffer.change_line_at(i, c)?;
@@ -384,7 +441,44 @@ where
                     }
                 }
                 self.buffer.last_sub = Some(sub);
-                self.postfix_command = suffix;
+                if update_remembered_flag {
+                    self.buffer.last_flag = remembered_flag;
+                }
+                let run_suffix = if repeated {
+                    if let Some(new_suffix) = suffix {
+                        let toggles_off = matches!(
+                            (&new_suffix, &self.buffer.last_suffix),
+                            (CommandKind::List, Some(CommandKind::List))
+                                | (CommandKind::NumberedList, Some(CommandKind::NumberedList))
+                                | (CommandKind::PrintList, Some(CommandKind::PrintList))
+                        );
+                        if toggles_off {
+                            self.buffer.last_suffix = None;
+                            false
+                        } else {
+                            self.buffer.last_suffix = Some(new_suffix);
+                            true
+                        }
+                    } else {
+                        self.buffer.last_suffix.is_some()
+                    }
+                } else {
+                    self.buffer.last_suffix = suffix;
+                    self.buffer.last_suffix.is_some()
+                };
+                if run_suffix {
+                    if matches!(self.buffer.last_suffix, Some(CommandKind::List)) {
+                        self.buffer.set_range(&Address::None)?;
+                        write!(self.writer, "{}", self.buffer.get_lines()?.well_defined())?;
+                    } else if matches!(self.buffer.last_suffix, Some(CommandKind::NumberedList)) {
+                        self.buffer.set_range(&Address::None)?;
+                        write!(self.writer, "{}", self.buffer.get_lines()?.numbered())?;
+                    } else if matches!(self.buffer.last_suffix, Some(CommandKind::PrintList)) {
+                        self.buffer.set_range(&Address::None)?;
+                        write!(self.writer, "{}", self.buffer.get_lines()?)?;
+                    }
+                }
+                self.postfix_command = None;
                 self.snapshot = Some(snapshot);
             } // _ => panic!("Unexpected Command"),
             CommandKind::File(name) => {
